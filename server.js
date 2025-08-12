@@ -2,6 +2,9 @@ import express from 'express';
 import http from 'http';
 import cors from 'cors';
 import { Server } from 'socket.io';
+import 'dotenv/config';
+import { connectDB } from './db.js';
+import Room from './models/Room.js';
 
 const app = express();
 
@@ -22,7 +25,53 @@ app.use(cors({
 }));
 app.use(express.json());
 
+// Health
 app.get('/health', (_req, res) => res.json({ ok: true }));
+
+// --- REST APIs for webapp <-> DB sync ---
+// Join a room (idempotent)
+app.post('/api/room/join', async (req, res) => {
+  try {
+    const { code, tgId, name } = req.body || {};
+    if (!code || !tgId) return res.status(400).json({ error: 'code and tgId required' });
+    const room = await Room.addOrUpdatePlayer(String(code).toUpperCase(), String(tgId), name, 0);
+    return res.json({ ok: true, room: { code: room.code, players: room.players } });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: 'join_failed' });
+  }
+});
+
+// Update score (either absolute score or delta)
+app.post('/api/score', async (req, res) => {
+  try {
+    const { code, tgId, name, score, deltaScore } = req.body || {};
+    if (!code || !tgId) return res.status(400).json({ error: 'code and tgId required' });
+    let room;
+    if (typeof score === 'number') {
+      room = await Room.setScore(String(code).toUpperCase(), String(tgId), name, score);
+    } else {
+      room = await Room.addOrUpdatePlayer(String(code).toUpperCase(), String(tgId), name, Number(deltaScore) || 0);
+    }
+    return res.json({ ok: true, room: { code: room.code, players: room.players } });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: 'score_update_failed' });
+  }
+});
+
+// Get leaderboard for a room
+app.get('/api/leaderboard', async (req, res) => {
+  try {
+    const code = String(req.query.code || '').toUpperCase();
+    if (!code) return res.status(400).json({ error: 'code required' });
+    const top = await Room.leaderboard(code, 10);
+    return res.json({ ok: true, code, top });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: 'leaderboard_failed' });
+  }
+});
 
 const server = http.createServer(app);
 const io = new Server(server, {
@@ -256,10 +305,17 @@ io.on('connection', (socket) => {
       if (!player.guessed && text.toLowerCase() === room.currentWord.toLowerCase()) {
         player.guessed = true;
         const timeBonus = Math.max(0, room.timer);
-        player.score += 100 + Math.floor(timeBonus);
+        const guessDelta = 100 + Math.floor(timeBonus);
+        player.score += guessDelta;
         const drawerId = Array.from(room.players.keys())[room.drawerIndex];
         const drawer = room.players.get(drawerId);
         if (drawer) drawer.score += 20;
+
+        // Persist deltas to MongoDB if tgIds known
+        try {
+          if (player.tgId) Room.addOrUpdatePlayer(String(room.code).toUpperCase(), String(player.tgId), player.name, guessDelta).catch(()=>{});
+          if (drawer?.tgId) Room.addOrUpdatePlayer(String(room.code).toUpperCase(), String(drawer.tgId), drawer.name, 20).catch(()=>{});
+        } catch {}
 
         io.to(socket.id).emit('chat', { system: true, message: 'You guessed the word!' });
         io.to(room.code).emit('chat', { system: true, message: `${player.name} guessed the word!` });
@@ -288,6 +344,9 @@ io.on('connection', (socket) => {
     }
   });
 });
+
+// Initialize DB only (bot runs in separate project now)
+connectDB(process.env.MONGODB_URI).catch((e) => console.error('MongoDB connection error', e));
 
 const port = process.env.PORT || 3000;
 server.listen(port, () => {
