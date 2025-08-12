@@ -4,14 +4,36 @@ import cors from 'cors';
 import { Server } from 'socket.io';
 
 const app = express();
-app.use(cors({ origin: ['https://tg-skribbl-frontend.vercel.app'], methods: ['GET','POST'] }));
+
+// Build allowed origins from environment
+const dev = process.env.NODE_ENV !== 'production';
+const envOrigins = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
+const defaultOrigins = ['https://tg-skribbl-frontend.vercel.app'];
+const localOrigins = ['http://localhost:5173', 'http://127.0.0.1:5173'];
+const allowedOrigins = [...new Set([...(envOrigins.length ? envOrigins : defaultOrigins), ...(dev ? localOrigins : [])])];
+
+app.use(cors({
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true); // allow non-browser tools
+    if (allowedOrigins.includes(origin)) return cb(null, true);
+    return cb(new Error('CORS not allowed for origin: ' + origin));
+  },
+  methods: ['GET','POST'],
+}));
 app.use(express.json());
 
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: { origin: ['https://tg-skribbl-frontend.vercel.app'], methods: ['GET', 'POST'] },
+  cors: {
+    origin: (origin, cb) => {
+      if (!origin) return cb(null, true);
+      if (allowedOrigins.includes(origin)) return cb(null, true);
+      return cb(new Error('Socket.IO CORS not allowed: ' + origin));
+    },
+    methods: ['GET', 'POST'],
+  },
 });
 
 const rooms = new Map();
