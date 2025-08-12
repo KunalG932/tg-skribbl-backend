@@ -4,7 +4,6 @@ import cors from 'cors';
 import { Server } from 'socket.io';
 
 const app = express();
-// Restrict CORS to your deployed frontend
 app.use(cors({ origin: ['https://tg-skribbl-frontend.vercel.app'], methods: ['GET','POST'] }));
 app.use(express.json());
 
@@ -15,16 +14,11 @@ const io = new Server(server, {
   cors: { origin: ['https://tg-skribbl-frontend.vercel.app'], methods: ['GET', 'POST'] },
 });
 
-// In-memory store
-const rooms = new Map(); // roomCode -> { players: Map(socketId,{id,name,tgId,score,guessed}), drawerIndex, round, maxRounds, currentWord, hint, phase, timer, choices }
-
-const DEFAULTS = {
-  roundTime: 75, // seconds per turn
-  maxRounds: 3,
-};
-
+const rooms = new Map();
+const DEFAULTS = { roundTime: 75, maxRounds: 3 };
 const WORDS = [
-  'cat','dog','house','car','tree','phone','pizza','guitar','rocket','flower','computer','book','chair','bottle','mountain','river','sun','moon','star','cloud'
+  'cat','dog','house','car','tree','phone','pizza','guitar','rocket','flower',
+  'computer','book','chair','bottle','mountain','river','sun','moon','star','cloud'
 ];
 
 function randomChoices(arr, n) {
@@ -43,7 +37,6 @@ function maskWord(word, revealed = new Set()) {
 function revealHintOverTime(room) {
   const { currentWord } = room;
   const indices = currentWord.split('').map((_, i) => i).filter(i => currentWord[i] !== ' ');
-  // reveal every ~20% time
   const toReveal = new Set();
   const interval = Math.max(8, Math.floor(DEFAULTS.roundTime * 0.2));
   const hintInterval = setInterval(() => {
@@ -60,7 +53,6 @@ function isCloseGuess(guess, word) {
   const a = guess.toLowerCase().trim();
   const b = word.toLowerCase().trim();
   if (!a || !b) return false;
-  // Levenshtein distance with early stop
   const maxClose = Math.max(1, Math.floor(b.length * 0.25));
   const dp = Array(b.length + 1).fill(0);
   for (let j = 0; j <= b.length; j++) dp[j] = j;
@@ -86,14 +78,15 @@ function getNextDrawerIndex(room) {
   return (room.drawerIndex + 1) % playerIds.length;
 }
 
-function allGuessedOrTimerEnded(room) {
+function allGuessed(room) {
   const players = Array.from(room.players.values());
-  const allGuessersDone = players.filter(p => p.id !== players[room.drawerIndex]?.id).every(p => p.guessed);
-  return allGuessersDone || room.timer <= 0;
+  return players.filter(p => p.id !== players[room.drawerIndex]?.id).every(p => p.guessed);
 }
 
 function broadcastRoomState(room) {
-  const players = Array.from(room.players.values()).map(p => ({ id: p.id, name: p.name, tgId: p.tgId || null, score: p.score, guessed: p.guessed }));
+  const players = Array.from(room.players.values()).map(p => ({
+    id: p.id, name: p.name, tgId: p.tgId || null, score: p.score, guessed: p.guessed
+  }));
   io.to(room.code).emit('room_state', {
     code: room.code,
     players,
@@ -114,9 +107,7 @@ function startTurn(room) {
   room.choices = randomChoices(WORDS, 3);
   const drawerId = Array.from(room.players.keys())[room.drawerIndex];
   io.to(room.code).emit('turn_start', { drawerId });
-  // Only send choices to drawer
   io.to(drawerId).emit('word_choices', room.choices);
-  // Reset guessed flags
   room.players.forEach(p => { p.guessed = false; });
 }
 
@@ -127,13 +118,15 @@ function beginDrawingPhase(room, word) {
   room.timer = DEFAULTS.roundTime;
   io.to(room.code).emit('hint_update', room.hint);
   broadcastRoomState(room);
-  // Start timers
+
   revealHintOverTime(room);
+
   const tick = setInterval(() => {
     if (room.phase !== 'drawing') { clearInterval(tick); return; }
     room.timer -= 1;
     io.to(room.code).emit('timer', room.timer);
-    if (allGuessedOrTimerEnded(room)) {
+
+    if (room.timer <= 0 || allGuessed(room)) {
       clearInterval(tick);
       endTurn(room);
     }
@@ -143,20 +136,19 @@ function beginDrawingPhase(room, word) {
 function endTurn(room) {
   room.phase = 'intermission';
   io.to(room.code).emit('turn_end', { word: room.currentWord });
-  // small delay then next
   setTimeout(() => nextTurnOrRound(room), 3000);
 }
 
 function nextTurnOrRound(room) {
-  // Advance drawer
   room.drawerIndex = getNextDrawerIndex(room);
-  // Check if round should increment (after cycling back to first drawer)
   if (room.drawerIndex === 0) {
     room.round += 1;
   }
   if (room.round > room.maxRounds) {
     room.phase = 'ending';
-    const finalScores = Array.from(room.players.values()).map(p => ({ id: p.id, name: p.name, tgId: p.tgId || null, score: p.score }));
+    const finalScores = Array.from(room.players.values()).map(p => ({
+      id: p.id, name: p.name, tgId: p.tgId || null, score: p.score
+    }));
     io.to(room.code).emit('game_over', { scores: finalScores });
     return;
   }
@@ -182,12 +174,14 @@ function ensureRoom(code) {
 }
 
 io.on('connection', (socket) => {
-  // Join/Create room
   socket.on('join_room', ({ code, name, tgId }) => {
     const room = ensureRoom(code);
     socket.join(code);
-    socket.join(socket.id); // private room for drawer choices
-    room.players.set(socket.id, { id: socket.id, name: name?.slice(0, 24) || 'Player', tgId: tgId || null, score: 0, guessed: false });
+    socket.join(socket.id);
+    room.players.set(socket.id, {
+      id: socket.id, name: name?.slice(0, 24) || 'Player', tgId: tgId || null,
+      score: 0, guessed: false
+    });
     broadcastRoomState(room);
     io.to(code).emit('chat', { system: true, message: `${name || 'Player'} joined.` });
   });
@@ -201,7 +195,6 @@ io.on('connection', (socket) => {
     broadcastRoomState(room);
   });
 
-  // Start game from lobby
   socket.on('start_game', ({ code }) => {
     const room = rooms.get(code);
     if (!room) return;
@@ -213,32 +206,30 @@ io.on('connection', (socket) => {
     startTurn(room);
   });
 
-  // Drawer picked word
   socket.on('choose_word', ({ code, word }) => {
     const room = rooms.get(code);
     if (!room) return;
     const drawerId = Array.from(room.players.keys())[room.drawerIndex];
-    if (socket.id !== drawerId) return; // only drawer
+    if (socket.id !== drawerId) return;
     if (!room.choices.includes(word)) return;
     beginDrawingPhase(room, word);
   });
 
-  // Drawing strokes relay
   socket.on('draw', ({ code, stroke }) => {
     const room = rooms.get(code);
     if (!room || room.phase !== 'drawing') return;
     const drawerId = Array.from(room.players.keys())[room.drawerIndex];
-    if (socket.id !== drawerId) return; // only drawer can draw
+    if (socket.id !== drawerId) return;
     socket.to(code).emit('draw', stroke);
   });
 
-  // Chat / guesses
   socket.on('chat', ({ code, message, name }) => {
     const room = rooms.get(code);
     if (!room) return;
     const player = room.players.get(socket.id);
     if (!player) return;
     const text = String(message || '').slice(0, 140);
+
     if (room.phase === 'drawing' && room.currentWord) {
       if (!player.guessed && text.toLowerCase() === room.currentWord.toLowerCase()) {
         player.guessed = true;
@@ -246,10 +237,15 @@ io.on('connection', (socket) => {
         player.score += 100 + Math.floor(timeBonus);
         const drawerId = Array.from(room.players.keys())[room.drawerIndex];
         const drawer = room.players.get(drawerId);
-        if (drawer) drawer.score += 20; // small drawer bonus
+        if (drawer) drawer.score += 20;
+
         io.to(socket.id).emit('chat', { system: true, message: 'You guessed the word!' });
         io.to(room.code).emit('chat', { system: true, message: `${player.name} guessed the word!` });
         broadcastRoomState(room);
+
+        if (allGuessed(room)) {
+          endTurn(room); // now will always advance to next drawer
+        }
         return;
       } else if (!player.guessed && isCloseGuess(text, room.currentWord)) {
         io.to(socket.id).emit('chat', { system: true, message: 'Close!' });
@@ -260,7 +256,6 @@ io.on('connection', (socket) => {
   });
 
   socket.on('disconnecting', () => {
-    // Remove player from any joined rooms
     for (const code of socket.rooms) {
       if (rooms.has(code)) {
         const room = rooms.get(code);
