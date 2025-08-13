@@ -217,6 +217,25 @@ io.on('connection', (socket) => {
         // Materialize in-memory room from DB (validated waiting)
         room = createRoom(raw);
       }
+      // Prevent duplicates: if this socket already present, just refresh info
+      if (room.players.has(socket.id)) {
+        const p = room.players.get(socket.id);
+        p.name = name?.slice(0, 24) || p.name;
+        p.tgId = tgId || p.tgId;
+        socket.join(raw);
+        socket.join(socket.id);
+        broadcastRoomState(io, room);
+        return;
+      }
+      // If same Telegram user already in room from another session, remove old entry
+      if (tgId) {
+        for (const [sid, p] of room.players.entries()) {
+          if (p.tgId && String(p.tgId) === String(tgId) && sid !== socket.id) {
+            room.players.delete(sid);
+            try { io.sockets.sockets.get(sid)?.leave(raw); } catch {}
+          }
+        }
+      }
       if (room.players.size >= MAX_PLAYERS) {
         io.to(socket.id).emit('error', { code: 'ROOM_FULL', room: raw });
         io.to(socket.id).emit('chat', { system: true, message: `Room ${raw} is full.` });
@@ -248,6 +267,25 @@ io.on('connection', (socket) => {
       io.to(socket.id).emit('error', { code: room.phase === 'ended' ? 'ROOM_ENDED' : 'ROOM_NOT_WAITING', room: raw, phase: room.phase });
       return;
     }
+    // Prevent duplicates: if this socket already present, just refresh info
+    if (room.players.has(socket.id)) {
+      const p = room.players.get(socket.id);
+      p.name = name?.slice(0, 24) || p.name;
+      p.tgId = tgId || p.tgId;
+      socket.join(raw);
+      socket.join(socket.id);
+      broadcastRoomState(io, room);
+      return;
+    }
+    // If same Telegram user already in room from another session, remove old entry
+    if (tgId) {
+      for (const [sid, p] of room.players.entries()) {
+        if (p.tgId && String(p.tgId) === String(tgId) && sid !== socket.id) {
+          room.players.delete(sid);
+          try { io.sockets.sockets.get(sid)?.leave(raw); } catch {}
+        }
+      }
+    }
     if (room.players.size >= MAX_PLAYERS) {
       io.to(socket.id).emit('error', { code: 'ROOM_FULL', room: raw });
       io.to(socket.id).emit('chat', { system: true, message: `Room ${raw} is full.` });
@@ -271,7 +309,7 @@ io.on('connection', (socket) => {
     room.players.delete(socket.id);
     socket.leave(code);
     io.to(code).emit('chat', { system: true, message: 'A player left.' });
-    broadcastRoomState(room);
+    broadcastRoomState(io, room);
   });
 
   socket.on('start_game', ({ code }) => {
