@@ -174,6 +174,10 @@ function nextTurnOrRound(room) {
       id: p.id, name: p.name, tgId: p.tgId || null, score: p.score
     }));
     io.to(room.code).emit('game_over', { scores: finalScores });
+    // Persist room phase as ended
+    (async () => {
+      try { if (roomsCol) await roomsCol.updateOne({ _id: room.code }, { $set: { phase: 'ended', endedAt: new Date() } }, { upsert: true }); } catch {}
+    })();
     return;
   }
   startTurn(room);
@@ -205,6 +209,7 @@ function createRoom(code) {
 const mongoUri = process.env.MONGODB_URI;
 let mongoClient = null;
 let usersCol = null;
+let roomsCol = null;
 
 async function initDb() {
   if (!mongoUri) {
@@ -217,6 +222,8 @@ async function initDb() {
   const db = mongoClient.db(dbName);
   usersCol = db.collection('users');
   await usersCol.createIndex({ _id: 1 });
+  roomsCol = db.collection('rooms');
+  await roomsCol.createIndex({ _id: 1 });
   console.log('Connected to MongoDB');
 }
 
@@ -241,19 +248,64 @@ async function incrementScore(userId, delta) {
 io.on('connection', (socket) => {
   socket.on('create_room', ({ code }) => {
     if (!code) return;
-    const created = createRoom(String(code));
-    io.to(socket.id).emit('chat', { system: true, message: `Room ${created.code} created.` });
-    broadcastRoomState(created);
+    const raw = String(code || '').trim().toUpperCase();
+    if (!/^[A-Z0-9]{4}$/.test(raw)) {
+      io.to(socket.id).emit('error', { code: 'INVALID_ROOM_CODE', room: raw });
+      io.to(socket.id).emit('chat', { system: true, message: 'Invalid room code. Use 4 letters/numbers (e.g., AB1C).' });
+      return;
+    }
+    (async () => {
+      try {
+        if (roomsCol) {
+          const r = await roomsCol.findOne({ _id: raw });
+          if (r && r.phase !== 'ended') {
+            io.to(socket.id).emit('error', { code: 'ROOM_EXISTS', room: raw });
+            io.to(socket.id).emit('chat', { system: true, message: `Room ${raw} already exists.` });
+            return;
+          }
+          // Create or overwrite ended room with new waiting state
+          await roomsCol.updateOne(
+            { _id: raw },
+            { $set: { _id: raw, phase: 'waiting', createdAt: new Date(), endedAt: null } },
+            { upsert: true }
+          );
+        }
+      } catch {}
+      const created = createRoom(raw);
+      io.to(socket.id).emit('chat', { system: true, message: `Room ${created.code} created.` });
+      broadcastRoomState(created);
+    })();
   });
 
   socket.on('join_room', async ({ code, name, tgId }) => {
-    const room = getRoom(code);
-    if (!room) {
-      io.to(socket.id).emit('chat', { system: true, message: `Room ${code} not found. Ask host to create it.` });
-      io.to(socket.id).emit('error', { code: 'ROOM_NOT_FOUND', room: code });
+    const raw = String(code || '').trim().toUpperCase();
+    if (!/^[A-Z0-9]{4}$/.test(raw)) {
+      io.to(socket.id).emit('chat', { system: true, message: 'Invalid room code. Use 4 letters/numbers (e.g., AB1C).' });
+      io.to(socket.id).emit('error', { code: 'INVALID_ROOM_CODE', room: raw });
       return;
     }
-    socket.join(code);
+    // Validate against DB if available
+    if (roomsCol) {
+      try {
+        const r = await roomsCol.findOne({ _id: raw });
+        if (!r) {
+          io.to(socket.id).emit('chat', { system: true, message: `Room ${raw} not found. Ask host to create it.` });
+          io.to(socket.id).emit('error', { code: 'ROOM_NOT_FOUND', room: raw });
+          return;
+        }
+        if (r.phase === 'ended') {
+          io.to(socket.id).emit('chat', { system: true, message: `Room ${raw} has ended.` });
+          io.to(socket.id).emit('error', { code: 'ROOM_ENDED', room: raw });
+          return;
+        }
+      } catch {}
+    }
+    let room = getRoom(raw);
+    if (!room) {
+      // Materialize in-memory room from DB (assume waiting)
+      room = createRoom(raw);
+    }
+    socket.join(raw);
     socket.join(socket.id);
     room.players.set(socket.id, {
       id: socket.id, name: name?.slice(0, 24) || 'Player', tgId: tgId || null,
@@ -262,7 +314,7 @@ io.on('connection', (socket) => {
     // ensure user exists in DB
     try { await ensureUser(tgId || socket.id, name, tgId); } catch {}
     broadcastRoomState(room);
-    io.to(code).emit('chat', { system: true, message: `${name || 'Player'} joined.` });
+    io.to(raw).emit('chat', { system: true, message: `${name || 'Player'} joined.` });
   });
 
   socket.on('leave_room', ({ code }) => {
