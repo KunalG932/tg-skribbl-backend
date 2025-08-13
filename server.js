@@ -297,6 +297,8 @@ io.on('connection', (socket) => {
     room.round = 1;
     room.drawerIndex = 0;
     room.phase = 'choosing';
+    // Initialize stable player order for rotation
+    room.playerOrder = Array.from(room.players.keys());
     // Attach WORDS directly onto the live room object so domain functions mutate the actual room
     room.WORDS = WORDS;
     startTurn(io, room);

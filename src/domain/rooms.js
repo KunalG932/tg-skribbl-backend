@@ -5,12 +5,14 @@ export function broadcastRoomState(io, room) {
   const players = Array.from(room.players.values()).map(p => ({
     id: p.id, name: p.name, tgId: p.tgId || null, score: p.score, guessed: p.guessed
   }))
+  const drawerOrder = Array.isArray(room.playerOrder) ? room.playerOrder : Array.from(room.players.keys())
+  const drawerId = drawerOrder[room.drawerIndex] || null
   io.to(room.code).emit('room_state', {
     code: room.code,
     players,
     round: room.round,
     maxRounds: room.maxRounds,
-    drawerId: Array.from(room.players.keys())[room.drawerIndex] || null,
+    drawerId,
     hint: room.hint || null,
     phase: room.phase,
     timer: room.timer,
@@ -18,14 +20,23 @@ export function broadcastRoomState(io, room) {
 }
 
 export function getNextDrawerIndex(room) {
-  const playerIds = Array.from(room.players.keys())
-  if (playerIds.length === 0) return 0
-  return (room.drawerIndex + 1) % playerIds.length
+  const order = Array.isArray(room.playerOrder) ? room.playerOrder : Array.from(room.players.keys())
+  if (order.length === 0) return 0
+  // Find next index whose id is still present in players map
+  const n = order.length
+  for (let step = 1; step <= n; step++) {
+    const idx = (room.drawerIndex + step) % n
+    const candidateId = order[idx]
+    if (room.players.has(candidateId)) return idx
+  }
+  return 0
 }
 
 export function allGuessed(room) {
   const players = Array.from(room.players.values())
-  return players.filter(p => p.id !== players[room.drawerIndex]?.id).every(p => p.guessed)
+  const order = Array.isArray(room.playerOrder) ? room.playerOrder : Array.from(room.players.keys())
+  const currentDrawerId = order[room.drawerIndex]
+  return players.filter(p => p.id !== currentDrawerId).every(p => p.guessed)
 }
 
 export function startTurn(io, room) {
@@ -34,7 +45,8 @@ export function startTurn(io, room) {
   room.currentWord = null
   room.hint = null
   room.choices = randomChoices(room.WORDS || [], 3)
-  const drawerId = Array.from(room.players.keys())[room.drawerIndex]
+  const order = Array.isArray(room.playerOrder) ? room.playerOrder : Array.from(room.players.keys())
+  const drawerId = order[room.drawerIndex]
   io.to(room.code).emit('turn_start', { drawerId })
   io.to(drawerId).emit('word_choices', room.choices)
   room.players.forEach(p => { p.guessed = false })
@@ -44,7 +56,11 @@ export function beginDrawingPhase(io, room, defaults, word) {
   room.currentWord = word
   room.hint = maskWord(word)
   room.phase = 'drawing'
-  room.timer = defaults.roundTime
+  // Dynamic round time: decrease per round (e.g., 1.0, 0.85, 0.7)
+  const base = Number(defaults?.roundTime || 75)
+  const multipliers = [1.0, 0.85, 0.7]
+  const m = multipliers[(room.round - 1) % multipliers.length] || 0.6
+  room.timer = Math.max(20, Math.round(base * m))
   io.to(room.code).emit('hint_update', room.hint)
   broadcastRoomState(io, room)
   revealHintOverTime(io, room, defaults)
@@ -68,9 +84,16 @@ export function endTurn(io, room) {
 }
 
 export function nextTurnOrRound(io, room) {
+  const prevIndex = room.drawerIndex
   room.drawerIndex = getNextDrawerIndex(room)
-  if (room.drawerIndex === 0) {
+  if (room.drawerIndex === 0 && prevIndex !== 0) {
     room.round += 1
+    // Announce next round start with reduced time matching beginDrawingPhase logic
+    const base = 75
+    const multipliers = [1.0, 0.85, 0.7]
+    const idx = Math.max(0, Math.min(multipliers.length - 1, room.round - 1))
+    const time = Math.max(20, Math.round(base * multipliers[idx]))
+    io.to(room.code).emit('round_started', { round: room.round, time })
   }
   if (room.round > room.maxRounds) {
     room.phase = 'ended'
