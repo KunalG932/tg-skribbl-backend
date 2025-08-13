@@ -3,16 +3,19 @@ import express from 'express';
 import http from 'http';
 import cors from 'cors';
 import { Server } from 'socket.io';
-import { MongoClient } from 'mongodb';
+// modular imports
+import { buildAllowedOrigins } from './src/config/env.js';
+import { initDb, ensureUser, incrementScore, getRoomsCol, getUsersCol } from './src/db/mongo.js';
+import { WORDS } from './src/domain/words.js';
+import { broadcastRoomState, startTurn, beginDrawingPhase, endTurn, nextTurnOrRound, allGuessed } from './src/domain/rooms.js';
+import { verifyTelegramInitData, extractUserFromInitData } from './src/security/telegram.js';
+import { guessScoreForTime, drawerBonus } from './src/domain/scoring.js';
+import { createRateLimiter } from './src/security/rateLimit.js';
 
 const app = express();
 
-// Build allowed origins from environment
-const dev = process.env.NODE_ENV !== 'production';
-const envOrigins = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
-const defaultOrigins = ['https://tg-skribbl-frontend.vercel.app'];
-const localOrigins = ['http://localhost:5173', 'http://127.0.0.1:5173'];
-const allowedOrigins = [...new Set([...(envOrigins.length ? envOrigins : defaultOrigins), ...(dev ? localOrigins : [])])];
+// Build allowed origins from environment (localhost only allowed in dev)
+const allowedOrigins = buildAllowedOrigins(process.env.NODE_ENV, process.env.ALLOWED_ORIGINS);
 
 app.use(cors({
   origin: (origin, cb) => {
@@ -25,6 +28,42 @@ app.use(cors({
 app.use(express.json());
 
 app.get('/health', (_req, res) => res.json({ ok: true }));
+// Leaderboard and profile APIs
+app.get('/api/leaderboard', async (_req, res) => {
+  try {
+    const roomsCol = getRoomsCol();
+    const usersCol = getUsersCol()
+    if (!usersCol) return res.json({ ok: true, users: [] })
+    const top = await usersCol.find({}, { projection: { _id: 1, name: 1, score: 1, tgId: 1 } })
+      .sort({ score: -1 })
+      .limit(Number(process.env.LEADERBOARD_LIMIT || 20))
+      .toArray()
+    return res.json({ ok: true, users: top })
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e?.message || String(e) })
+  }
+})
+
+app.get('/api/profile', async (req, res) => {
+  try {
+    const botToken = process.env.TELEGRAM_BOT_TOKEN
+    const usersCol = getUsersCol()
+    if (!usersCol) return res.json({ ok: true, user: null })
+    let tgId = null
+    if (botToken && req.query.initData) {
+      const v = verifyTelegramInitData(String(req.query.initData), botToken)
+      if (v.ok) tgId = extractUserFromInitData(v.data)?.id || null
+    } else if (req.query.tgId) {
+      // dev fallback
+      tgId = String(req.query.tgId)
+    }
+    if (!tgId) return res.json({ ok: true, user: null })
+    const user = await usersCol.findOne({ _id: String(tgId) }, { projection: { _id: 1, name: 1, score: 1, tgId: 1 } })
+    return res.json({ ok: true, user })
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e?.message || String(e) })
+  }
+})
 
 const server = http.createServer(app);
 const io = new Server(server, {
@@ -40,38 +79,7 @@ const io = new Server(server, {
 
 const rooms = new Map();
 const DEFAULTS = { roundTime: 75, maxRounds: 3 };
-const WORDS = [
-  'cat','dog','house','car','tree','phone','pizza','guitar','rocket','flower',
-  'computer','book','chair','bottle','mountain','river','sun','moon','star','cloud'
-];
-
-function randomChoices(arr, n) {
-  const copy = [...arr];
-  const out = [];
-  while (out.length < n && copy.length) {
-    out.push(copy.splice(Math.floor(Math.random() * copy.length), 1)[0]);
-  }
-  return out;
-}
-
-function maskWord(word, revealed = new Set()) {
-  return word.split('').map((ch, i) => (ch === ' ' ? ' ' : revealed.has(i) ? ch : '_')).join('');
-}
-
-function revealHintOverTime(room) {
-  const { currentWord } = room;
-  const indices = currentWord.split('').map((_, i) => i).filter(i => currentWord[i] !== ' ');
-  const toReveal = new Set();
-  const interval = Math.max(8, Math.floor(DEFAULTS.roundTime * 0.2));
-  const hintInterval = setInterval(() => {
-    if (room.phase !== 'drawing') { clearInterval(hintInterval); return; }
-    if (indices.length === 0) { clearInterval(hintInterval); return; }
-    const idx = indices.splice(Math.floor(Math.random()*indices.length), 1)[0];
-    toReveal.add(idx);
-    room.hint = maskWord(currentWord, toReveal);
-    io.to(room.code).emit('hint_update', room.hint);
-  }, interval * 1000);
-}
+const MAX_PLAYERS = Number(process.env.MAX_PLAYERS || 12);
 
 function isCloseGuess(guess, word) {
   const a = guess.toLowerCase().trim();
@@ -96,92 +104,7 @@ function isCloseGuess(guess, word) {
   return dp[b.length] <= maxClose;
 }
 
-function getNextDrawerIndex(room) {
-  const playerIds = Array.from(room.players.keys());
-  if (playerIds.length === 0) return 0;
-  return (room.drawerIndex + 1) % playerIds.length;
-}
-
-function allGuessed(room) {
-  const players = Array.from(room.players.values());
-  return players.filter(p => p.id !== players[room.drawerIndex]?.id).every(p => p.guessed);
-}
-
-function broadcastRoomState(room) {
-  const players = Array.from(room.players.values()).map(p => ({
-    id: p.id, name: p.name, tgId: p.tgId || null, score: p.score, guessed: p.guessed
-  }));
-  io.to(room.code).emit('room_state', {
-    code: room.code,
-    players,
-    round: room.round,
-    maxRounds: room.maxRounds,
-    drawerId: Array.from(room.players.keys())[room.drawerIndex] || null,
-    hint: room.hint || null,
-    phase: room.phase,
-    timer: room.timer,
-  });
-}
-
-function startTurn(room) {
-  if (room.phase === 'ended') return;
-  room.phase = 'choosing';
-  room.currentWord = null;
-  room.hint = null;
-  room.choices = randomChoices(WORDS, 3);
-  const drawerId = Array.from(room.players.keys())[room.drawerIndex];
-  io.to(room.code).emit('turn_start', { drawerId });
-  io.to(drawerId).emit('word_choices', room.choices);
-  room.players.forEach(p => { p.guessed = false; });
-}
-
-function beginDrawingPhase(room, word) {
-  room.currentWord = word;
-  room.hint = maskWord(word);
-  room.phase = 'drawing';
-  room.timer = DEFAULTS.roundTime;
-  io.to(room.code).emit('hint_update', room.hint);
-  broadcastRoomState(room);
-
-  revealHintOverTime(room);
-
-  const tick = setInterval(() => {
-    if (room.phase !== 'drawing') { clearInterval(tick); return; }
-    room.timer -= 1;
-    io.to(room.code).emit('timer', room.timer);
-
-    if (room.timer <= 0 || allGuessed(room)) {
-      clearInterval(tick);
-      endTurn(room);
-    }
-  }, 1000);
-}
-
-function endTurn(room) {
-  room.phase = 'intermission';
-  io.to(room.code).emit('turn_end', { word: room.currentWord });
-  setTimeout(() => nextTurnOrRound(room), 3000);
-}
-
-function nextTurnOrRound(room) {
-  room.drawerIndex = getNextDrawerIndex(room);
-  if (room.drawerIndex === 0) {
-    room.round += 1;
-  }
-  if (room.round > room.maxRounds) {
-    room.phase = 'ended';
-    const finalScores = Array.from(room.players.values()).map(p => ({
-      id: p.id, name: p.name, tgId: p.tgId || null, score: p.score
-    }));
-    io.to(room.code).emit('game_over', { scores: finalScores });
-    // Persist room phase as ended
-    (async () => {
-      try { if (roomsCol) await roomsCol.updateOne({ _id: room.code }, { $set: { phase: 'ended', endedAt: new Date() } }, { upsert: true }); } catch {}
-    })();
-    return;
-  }
-  startTurn(room);
-}
+// lifecycle functions moved to domain/rooms.js
 
 function getRoom(code) {
   return rooms.get(code);
@@ -205,47 +128,13 @@ function createRoom(code) {
   return room;
 }
 
-// ----------------- MongoDB -----------------
+// ----------------- MongoDB via module -----------------
 const mongoUri = process.env.MONGODB_URI;
-let mongoClient = null;
-let usersCol = null;
-let roomsCol = null;
-
-async function initDb() {
-  if (!mongoUri) {
-    console.warn('MONGODB_URI not set; user scores will not persist.');
-    return;
-  }
-  mongoClient = new MongoClient(mongoUri, { serverSelectionTimeoutMS: 5000 });
-  await mongoClient.connect();
-  const dbName = process.env.MONGODB_DB || 'scribbly';
-  const db = mongoClient.db(dbName);
-  usersCol = db.collection('users');
-  await usersCol.createIndex({ _id: 1 });
-  roomsCol = db.collection('rooms');
-  await roomsCol.createIndex({ _id: 1 });
-  console.log('Connected to MongoDB');
-}
-
-async function ensureUser(userId, name, tgId) {
-  if (!usersCol || !userId) return;
-  await usersCol.updateOne(
-    { _id: String(userId) },
-    { $setOnInsert: { _id: String(userId), tgId: tgId || null, name: name || 'Player', score: 0 } },
-    { upsert: true }
-  );
-}
-
-async function incrementScore(userId, delta) {
-  if (!usersCol || !userId || !delta) return;
-  await usersCol.updateOne(
-    { _id: String(userId) },
-    { $inc: { score: delta } },
-    { upsert: true }
-  );
-}
 
 io.on('connection', (socket) => {
+  // Per-socket rate limiting using sliding windows
+  const chatLimiter = createRateLimiter({ count: 5, windowMs: 3000 })
+  const drawLimiter = createRateLimiter({ count: 120, windowMs: 3000 })
   socket.on('create_room', ({ code }) => {
     if (!code) return;
     const raw = String(code || '').trim().toUpperCase();
@@ -256,6 +145,7 @@ io.on('connection', (socket) => {
     }
     (async () => {
       try {
+        const roomsCol = getRoomsCol();
         if (roomsCol) {
           const r = await roomsCol.findOne({ _id: raw });
           if (r && r.phase !== 'ended') {
@@ -273,19 +163,41 @@ io.on('connection', (socket) => {
       } catch {}
       const created = createRoom(raw);
       io.to(socket.id).emit('chat', { system: true, message: `Room ${created.code} created.` });
-      broadcastRoomState(created);
+      // Explicit ack to fix create/join race on the client
+      io.to(socket.id).emit('room_created', { code: created.code });
+      broadcastRoomState(io, created);
     })();
   });
 
-  socket.on('join_room', async ({ code, name, tgId }) => {
+  socket.on('join_room', async ({ code, name, tgId, initData }) => {
     const raw = String(code || '').trim().toUpperCase();
     if (!/^[A-Z0-9]{4}$/.test(raw)) {
       io.to(socket.id).emit('chat', { system: true, message: 'Invalid room code. Use 4 letters/numbers (e.g., AB1C).' });
       io.to(socket.id).emit('error', { code: 'INVALID_ROOM_CODE', room: raw });
       return;
     }
+    // If BOT token is configured, verify Telegram initData and override identity
+    const botToken = process.env.TELEGRAM_BOT_TOKEN;
+    let verified = null;
+    if (botToken) {
+      const res = verifyTelegramInitData(initData || '', botToken);
+      if (!res.ok) {
+        io.to(socket.id).emit('error', { code: 'AUTH_FAILED' });
+        io.to(socket.id).emit('chat', { system: true, message: 'Authentication failed.' });
+        return;
+      }
+      const u = extractUserFromInitData(res.data);
+      if (u) {
+        tgId = u.id;
+        name = u.name;
+      }
+      verified = u;
+    }
+
     // Validate against DB if available
-    if (roomsCol) {
+    {
+      const roomsCol = getRoomsCol();
+      if (roomsCol) {
       try {
         const r = await roomsCol.findOne({ _id: raw });
         if (!r) {
@@ -305,6 +217,11 @@ io.on('connection', (socket) => {
         // Materialize in-memory room from DB (validated waiting)
         room = createRoom(raw);
       }
+      if (room.players.size >= MAX_PLAYERS) {
+        io.to(socket.id).emit('error', { code: 'ROOM_FULL', room: raw });
+        io.to(socket.id).emit('chat', { system: true, message: `Room ${raw} is full.` });
+        return;
+      }
       // proceed with join using validated room
       socket.join(raw);
       socket.join(socket.id);
@@ -313,9 +230,10 @@ io.on('connection', (socket) => {
         score: 0, guessed: false
       });
       try { await ensureUser(tgId || socket.id, name, tgId); } catch {}
-      broadcastRoomState(room);
+      broadcastRoomState(io, room);
       io.to(raw).emit('chat', { system: true, message: `${name || 'Player'} joined.` });
       return;
+    }
     }
     // If no DB, use in-memory validation only (never create on join)
     const room = getRoom(raw);
@@ -330,6 +248,11 @@ io.on('connection', (socket) => {
       io.to(socket.id).emit('error', { code: room.phase === 'ended' ? 'ROOM_ENDED' : 'ROOM_NOT_WAITING', room: raw, phase: room.phase });
       return;
     }
+    if (room.players.size >= MAX_PLAYERS) {
+      io.to(socket.id).emit('error', { code: 'ROOM_FULL', room: raw });
+      io.to(socket.id).emit('chat', { system: true, message: `Room ${raw} is full.` });
+      return;
+    }
     socket.join(raw);
     socket.join(socket.id);
     room.players.set(socket.id, {
@@ -338,7 +261,7 @@ io.on('connection', (socket) => {
     });
     // ensure user exists in DB
     try { await ensureUser(tgId || socket.id, name, tgId); } catch {}
-    broadcastRoomState(room);
+    broadcastRoomState(io, room);
     io.to(raw).emit('chat', { system: true, message: `${name || 'Player'} joined.` });
   });
 
@@ -354,12 +277,14 @@ io.on('connection', (socket) => {
   socket.on('start_game', ({ code }) => {
     const room = rooms.get(code);
     if (!room) return;
-    if (room.players.size < 1) return;
+    // require at least 2 players to start
+    if (room.players.size < 2) return;
     if (room.phase !== 'waiting' && room.phase !== 'ended') return;
     room.round = 1;
     room.drawerIndex = 0;
     room.phase = 'choosing';
-    startTurn(room);
+    startTurn(io, { ...room, WORDS });
+    io.to(code).emit('game_started', { ok: true })
   });
 
   socket.on('choose_word', ({ code, word }) => {
@@ -368,7 +293,8 @@ io.on('connection', (socket) => {
     const drawerId = Array.from(room.players.keys())[room.drawerIndex];
     if (socket.id !== drawerId) return;
     if (!room.choices.includes(word)) return;
-    beginDrawingPhase(room, word);
+    beginDrawingPhase(io, room, DEFAULTS, word);
+    io.to(socket.id).emit('word_chosen', { ok: true })
   });
 
   socket.on('draw', ({ code, stroke }) => {
@@ -376,7 +302,27 @@ io.on('connection', (socket) => {
     if (!room || room.phase !== 'drawing') return;
     const drawerId = Array.from(room.players.keys())[room.drawerIndex];
     if (socket.id !== drawerId) return;
-    socket.to(code).emit('draw', stroke);
+    // rate limit draw events
+    if (!drawLimiter.allow()) {
+      return;
+    }
+    // validate stroke payload
+    if (!stroke || typeof stroke !== 'object') return;
+    const type = stroke.type;
+    const size = Math.max(1, Math.min(16, Number(stroke.size || 4)));
+    const color = typeof stroke.color === 'string' && stroke.color.length <= 16 ? stroke.color : '#111111';
+    const isNum = (v) => typeof v === 'number' && Number.isFinite(v);
+    let valid = false;
+    if (type === 'begin') {
+      valid = isNum(stroke.x) && isNum(stroke.y);
+    } else if (type === 'line') {
+      valid = isNum(stroke.x1) && isNum(stroke.y1) && isNum(stroke.x2) && isNum(stroke.y2);
+    } else if (type === 'clear') {
+      valid = true;
+    }
+    if (!valid) return;
+    const safeStroke = { ...stroke, size, color };
+    socket.to(code).emit('draw', safeStroke);
   });
 
   socket.on('chat', async ({ code, message, name }) => {
@@ -384,30 +330,35 @@ io.on('connection', (socket) => {
     if (!room) return;
     const player = room.players.get(socket.id);
     if (!player) return;
-    const text = String(message || '').slice(0, 140);
+    // rate limit chat
+    if (!chatLimiter.allow()) {
+      io.to(socket.id).emit('chat', { system: true, message: 'You are sending messages too fast.' });
+      return;
+    }
+    const text = String(message || '').trim().slice(0, 140);
+    if (!text) return;
 
     if (room.phase === 'drawing' && room.currentWord) {
       if (!player.guessed && text.toLowerCase() === room.currentWord.toLowerCase()) {
         player.guessed = true;
-        const timeBonus = Math.max(0, room.timer);
-        const guessScore = 100 + Math.floor(timeBonus);
+        const guessScore = guessScoreForTime(room.timer);
         player.score += guessScore;
         const drawerId = Array.from(room.players.keys())[room.drawerIndex];
         const drawer = room.players.get(drawerId);
-        if (drawer) drawer.score += 20;
+        if (drawer) drawer.score += drawerBonus();
 
         // persist scores
         try {
           await incrementScore(player.tgId || player.id, guessScore);
-          if (drawer) await incrementScore(drawer.tgId || drawer.id, 20);
+          if (drawer) await incrementScore(drawer.tgId || drawer.id, drawerBonus());
         } catch {}
 
         io.to(socket.id).emit('chat', { system: true, message: 'You guessed the word!' });
         io.to(room.code).emit('chat', { system: true, message: `${player.name} guessed the word!` });
-        broadcastRoomState(room);
+        broadcastRoomState(io, room);
 
         if (allGuessed(room)) {
-          endTurn(room); // now will always advance to next drawer
+          endTurn(io, room); // now will always advance to next drawer
         }
         return;
       } else if (!player.guessed && isCloseGuess(text, room.currentWord)) {
@@ -422,9 +373,14 @@ io.on('connection', (socket) => {
     for (const code of socket.rooms) {
       if (rooms.has(code)) {
         const room = rooms.get(code);
+        const wasDrawerId = Array.from(room.players.keys())[room.drawerIndex];
         room.players.delete(socket.id);
         io.to(code).emit('chat', { system: true, message: 'A player disconnected.' });
-        broadcastRoomState(room);
+        broadcastRoomState(io, room);
+        // If the drawer disconnected during an active choosing/drawing phase, end the turn early
+        if (socket.id === wasDrawerId && (room.phase === 'drawing' || room.phase === 'choosing')) {
+          try { endTurn(io, room); } catch {}
+        }
       }
     }
   });
@@ -433,7 +389,7 @@ io.on('connection', (socket) => {
 const port = process.env.PORT || 3000;
 (async () => {
   try {
-    await initDb();
+    await initDb(mongoUri, process.env.MONGODB_DB || 'scribbly');
   } catch (e) {
     console.warn('MongoDB init failed:', e?.message || e);
   }
