@@ -1,10 +1,9 @@
+import 'dotenv/config';
 import express from 'express';
 import http from 'http';
 import cors from 'cors';
 import { Server } from 'socket.io';
-import 'dotenv/config';
-import { connectDB } from './db.js';
-import Room from './models/Room.js';
+import { MongoClient } from 'mongodb';
 
 const app = express();
 
@@ -25,53 +24,7 @@ app.use(cors({
 }));
 app.use(express.json());
 
-// Health
 app.get('/health', (_req, res) => res.json({ ok: true }));
-
-// --- REST APIs for webapp <-> DB sync ---
-// Join a room (idempotent)
-app.post('/api/room/join', async (req, res) => {
-  try {
-    const { code, tgId, name } = req.body || {};
-    if (!code || !tgId) return res.status(400).json({ error: 'code and tgId required' });
-    const room = await Room.addOrUpdatePlayer(String(code).toUpperCase(), String(tgId), name, 0);
-    return res.json({ ok: true, room: { code: room.code, players: room.players } });
-  } catch (e) {
-    console.error(e);
-    return res.status(500).json({ error: 'join_failed' });
-  }
-});
-
-// Update score (either absolute score or delta)
-app.post('/api/score', async (req, res) => {
-  try {
-    const { code, tgId, name, score, deltaScore } = req.body || {};
-    if (!code || !tgId) return res.status(400).json({ error: 'code and tgId required' });
-    let room;
-    if (typeof score === 'number') {
-      room = await Room.setScore(String(code).toUpperCase(), String(tgId), name, score);
-    } else {
-      room = await Room.addOrUpdatePlayer(String(code).toUpperCase(), String(tgId), name, Number(deltaScore) || 0);
-    }
-    return res.json({ ok: true, room: { code: room.code, players: room.players } });
-  } catch (e) {
-    console.error(e);
-    return res.status(500).json({ error: 'score_update_failed' });
-  }
-});
-
-// Get leaderboard for a room
-app.get('/api/leaderboard', async (req, res) => {
-  try {
-    const code = String(req.query.code || '').toUpperCase();
-    if (!code) return res.status(400).json({ error: 'code required' });
-    const top = await Room.leaderboard(code, 10);
-    return res.json({ ok: true, code, top });
-  } catch (e) {
-    console.error(e);
-    return res.status(500).json({ error: 'leaderboard_failed' });
-  }
-});
 
 const server = http.createServer(app);
 const io = new Server(server, {
@@ -171,7 +124,7 @@ function broadcastRoomState(room) {
 }
 
 function startTurn(room) {
-  if (room.phase === 'ending') return;
+  if (room.phase === 'ended') return;
   room.phase = 'choosing';
   room.currentWord = null;
   room.hint = null;
@@ -216,7 +169,7 @@ function nextTurnOrRound(room) {
     room.round += 1;
   }
   if (room.round > room.maxRounds) {
-    room.phase = 'ending';
+    room.phase = 'ended';
     const finalScores = Array.from(room.players.values()).map(p => ({
       id: p.id, name: p.name, tgId: p.tgId || null, score: p.score
     }));
@@ -226,33 +179,88 @@ function nextTurnOrRound(room) {
   startTurn(room);
 }
 
-function ensureRoom(code) {
-  if (!rooms.has(code)) {
-    rooms.set(code, {
-      code,
-      players: new Map(),
-      drawerIndex: 0,
-      round: 1,
-      maxRounds: DEFAULTS.maxRounds,
-      currentWord: null,
-      hint: null,
-      phase: 'lobby',
-      timer: 0,
-      choices: [],
-    });
-  }
+function getRoom(code) {
   return rooms.get(code);
 }
 
+function createRoom(code) {
+  if (rooms.has(code)) return rooms.get(code);
+  const room = {
+    code,
+    players: new Map(),
+    drawerIndex: 0,
+    round: 1,
+    maxRounds: DEFAULTS.maxRounds,
+    currentWord: null,
+    hint: null,
+    phase: 'waiting',
+    timer: 0,
+    choices: [],
+  };
+  rooms.set(code, room);
+  return room;
+}
+
+// ----------------- MongoDB -----------------
+const mongoUri = process.env.MONGODB_URI;
+let mongoClient = null;
+let usersCol = null;
+
+async function initDb() {
+  if (!mongoUri) {
+    console.warn('MONGODB_URI not set; user scores will not persist.');
+    return;
+  }
+  mongoClient = new MongoClient(mongoUri, { serverSelectionTimeoutMS: 5000 });
+  await mongoClient.connect();
+  const dbName = process.env.MONGODB_DB || 'scribbly';
+  const db = mongoClient.db(dbName);
+  usersCol = db.collection('users');
+  await usersCol.createIndex({ _id: 1 });
+  console.log('Connected to MongoDB');
+}
+
+async function ensureUser(userId, name, tgId) {
+  if (!usersCol || !userId) return;
+  await usersCol.updateOne(
+    { _id: String(userId) },
+    { $setOnInsert: { _id: String(userId), tgId: tgId || null, name: name || 'Player', score: 0 } },
+    { upsert: true }
+  );
+}
+
+async function incrementScore(userId, delta) {
+  if (!usersCol || !userId || !delta) return;
+  await usersCol.updateOne(
+    { _id: String(userId) },
+    { $inc: { score: delta } },
+    { upsert: true }
+  );
+}
+
 io.on('connection', (socket) => {
-  socket.on('join_room', ({ code, name, tgId }) => {
-    const room = ensureRoom(code);
+  socket.on('create_room', ({ code }) => {
+    if (!code) return;
+    const created = createRoom(String(code));
+    io.to(socket.id).emit('chat', { system: true, message: `Room ${created.code} created.` });
+    broadcastRoomState(created);
+  });
+
+  socket.on('join_room', async ({ code, name, tgId }) => {
+    const room = getRoom(code);
+    if (!room) {
+      io.to(socket.id).emit('chat', { system: true, message: `Room ${code} not found. Ask host to create it.` });
+      io.to(socket.id).emit('error', { code: 'ROOM_NOT_FOUND', room: code });
+      return;
+    }
     socket.join(code);
     socket.join(socket.id);
     room.players.set(socket.id, {
       id: socket.id, name: name?.slice(0, 24) || 'Player', tgId: tgId || null,
       score: 0, guessed: false
     });
+    // ensure user exists in DB
+    try { await ensureUser(tgId || socket.id, name, tgId); } catch {}
     broadcastRoomState(room);
     io.to(code).emit('chat', { system: true, message: `${name || 'Player'} joined.` });
   });
@@ -270,7 +278,7 @@ io.on('connection', (socket) => {
     const room = rooms.get(code);
     if (!room) return;
     if (room.players.size < 1) return;
-    if (room.phase !== 'lobby' && room.phase !== 'ending') return;
+    if (room.phase !== 'waiting' && room.phase !== 'ended') return;
     room.round = 1;
     room.drawerIndex = 0;
     room.phase = 'choosing';
@@ -294,7 +302,7 @@ io.on('connection', (socket) => {
     socket.to(code).emit('draw', stroke);
   });
 
-  socket.on('chat', ({ code, message, name }) => {
+  socket.on('chat', async ({ code, message, name }) => {
     const room = rooms.get(code);
     if (!room) return;
     const player = room.players.get(socket.id);
@@ -305,16 +313,16 @@ io.on('connection', (socket) => {
       if (!player.guessed && text.toLowerCase() === room.currentWord.toLowerCase()) {
         player.guessed = true;
         const timeBonus = Math.max(0, room.timer);
-        const guessDelta = 100 + Math.floor(timeBonus);
-        player.score += guessDelta;
+        const guessScore = 100 + Math.floor(timeBonus);
+        player.score += guessScore;
         const drawerId = Array.from(room.players.keys())[room.drawerIndex];
         const drawer = room.players.get(drawerId);
         if (drawer) drawer.score += 20;
 
-        // Persist deltas to MongoDB if tgIds known
+        // persist scores
         try {
-          if (player.tgId) Room.addOrUpdatePlayer(String(room.code).toUpperCase(), String(player.tgId), player.name, guessDelta).catch(()=>{});
-          if (drawer?.tgId) Room.addOrUpdatePlayer(String(room.code).toUpperCase(), String(drawer.tgId), drawer.name, 20).catch(()=>{});
+          await incrementScore(player.tgId || player.id, guessScore);
+          if (drawer) await incrementScore(drawer.tgId || drawer.id, 20);
         } catch {}
 
         io.to(socket.id).emit('chat', { system: true, message: 'You guessed the word!' });
@@ -345,10 +353,14 @@ io.on('connection', (socket) => {
   });
 });
 
-// Initialize DB only (bot runs in separate project now)
-connectDB(process.env.MONGODB_URI).catch((e) => console.error('MongoDB connection error', e));
-
 const port = process.env.PORT || 3000;
-server.listen(port, () => {
-  console.log(`Server listening on :${port}`);
-});
+(async () => {
+  try {
+    await initDb();
+  } catch (e) {
+    console.warn('MongoDB init failed:', e?.message || e);
+  }
+  server.listen(port, () => {
+    console.log(`Server listening on :${port}`);
+  });
+})();
