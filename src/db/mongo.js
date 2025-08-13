@@ -40,3 +40,21 @@ export async function incrementScore(userId, delta) {
     { upsert: true }
   )
 }
+
+export async function incrementGamesPlayed(userId, delta = 1) {
+  if (!usersCol || !userId || !delta) return
+  await usersCol.updateOne(
+    { _id: String(userId) },
+    { $inc: { 'stats.gamesPlayed': delta } },
+    { upsert: true }
+  )
+}
+
+export async function addToTotalScore(userId, delta) {
+  if (!usersCol || !userId || !delta) return
+  await usersCol.updateOne(
+    { _id: String(userId) },
+    { $inc: { 'stats.totalScore': delta } },
+    { upsert: true }
+  )
+}

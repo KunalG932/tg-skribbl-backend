@@ -3,23 +3,20 @@ import express from 'express';
 import http from 'http';
 import cors from 'cors';
 import { Server } from 'socket.io';
-// modular imports
 import { buildAllowedOrigins } from './src/config/env.js';
-import { initDb, ensureUser, incrementScore, getRoomsCol, getUsersCol } from './src/db/mongo.js';
+import { initDb, ensureUser, incrementScore, getRoomsCol, getUsersCol, incrementGamesPlayed, addToTotalScore } from './src/db/mongo.js';
 import { WORDS } from './src/domain/words.js';
 import { broadcastRoomState, startTurn, beginDrawingPhase, endTurn, nextTurnOrRound, allGuessed } from './src/domain/rooms.js';
-// Telegram verification removed: joins and profile no longer require initData
 import { guessScoreForTime, drawerBonus } from './src/domain/scoring.js';
 import { createRateLimiter } from './src/security/rateLimit.js';
 
 const app = express();
 
-// Build allowed origins from environment (localhost only allowed in dev)
 const allowedOrigins = buildAllowedOrigins(process.env.NODE_ENV, process.env.ALLOWED_ORIGINS);
 
 app.use(cors({
   origin: (origin, cb) => {
-    if (!origin) return cb(null, true); // allow non-browser tools
+    if (!origin) return cb(null, true);
     if (allowedOrigins.includes(origin)) return cb(null, true);
     return cb(new Error('CORS not allowed for origin: ' + origin));
   },
@@ -28,53 +25,52 @@ app.use(cors({
 app.use(express.json());
 
 app.get('/health', (_req, res) => res.json({ ok: true }));
-// Leaderboard and profile APIs
+
 app.get('/api/leaderboard', async (_req, res) => {
   try {
     const roomsCol = getRoomsCol();
-    const usersCol = getUsersCol()
-    if (!usersCol) return res.json({ ok: true, users: [] })
+    const usersCol = getUsersCol();
+    if (!usersCol) return res.json({ ok: true, users: [] });
     const top = await usersCol.find({}, { projection: { _id: 1, name: 1, score: 1, tgId: 1, avatarUrl: 1, theme: 1 } })
       .sort({ score: -1 })
       .limit(Number(process.env.LEADERBOARD_LIMIT || 20))
-      .toArray()
-    return res.json({ ok: true, users: top })
+      .toArray();
+    return res.json({ ok: true, users: top });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: e?.message || String(e) })
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
-})
+});
 
 app.get('/api/profile', async (req, res) => {
   try {
-    const usersCol = getUsersCol()
-    if (!usersCol) return res.json({ ok: true, user: null })
-    const tgId = req.query.tgId ? String(req.query.tgId) : null
-    if (!tgId) return res.json({ ok: true, user: null })
-    const user = await usersCol.findOne({ _id: String(tgId) }, { projection: { _id: 1, name: 1, score: 1, tgId: 1, avatarUrl: 1, theme: 1, stats: 1 } })
-    return res.json({ ok: true, user })
+    const usersCol = getUsersCol();
+    if (!usersCol) return res.json({ ok: true, user: null });
+    const tgId = req.query.tgId ? String(req.query.tgId) : null;
+    if (!tgId) return res.json({ ok: true, user: null });
+    const user = await usersCol.findOne({ _id: String(tgId) }, { projection: { _id: 1, name: 1, score: 1, tgId: 1, avatarUrl: 1, theme: 1, stats: 1 } });
+    return res.json({ ok: true, user });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: e?.message || String(e) })
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
-})
+});
 
-// Save user profile/theme/avatar
 app.post('/api/profile', async (req, res) => {
   try {
-    const usersCol = getUsersCol()
-    if (!usersCol) return res.json({ ok: true })
-    const { tgId, name, avatarUrl, theme } = req.body || {}
-    if (!tgId) return res.status(400).json({ ok: false, error: 'tgId required' })
-    const _id = String(tgId)
-    const $set = {}
-    if (name) $set.name = String(name).slice(0, 50)
-    if (avatarUrl) $set.avatarUrl = String(avatarUrl)
-    if (theme === 'light' || theme === 'dark') $set.theme = theme
-    await usersCol.updateOne({ _id }, { $set: { _id, tgId: _id, ...$set } }, { upsert: true })
-    return res.json({ ok: true })
+    const usersCol = getUsersCol();
+    if (!usersCol) return res.json({ ok: true });
+    const { tgId, name, avatarUrl, theme } = req.body || {};
+    if (!tgId) return res.status(400).json({ ok: false, error: 'tgId required' });
+    const _id = String(tgId);
+    const $set = {};
+    if (name) $set.name = String(name).slice(0, 50);
+    if (avatarUrl) $set.avatarUrl = String(avatarUrl);
+    if (theme === 'light' || theme === 'dark') $set.theme = theme;
+    await usersCol.updateOne({ _id }, { $set: { _id, tgId: _id, ...$set } }, { upsert: true });
+    return res.json({ ok: true });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: e?.message || String(e) })
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
-})
+});
 
 const server = http.createServer(app);
 const io = new Server(server, {
@@ -115,8 +111,6 @@ function isCloseGuess(guess, word) {
   return dp[b.length] <= maxClose;
 }
 
-// lifecycle functions moved to domain/rooms.js
-
 function getRoom(code) {
   return rooms.get(code);
 }
@@ -134,18 +128,18 @@ function createRoom(code) {
     phase: 'waiting',
     timer: 0,
     choices: [],
+    joinedSet: new Set(),
   };
   rooms.set(code, room);
   return room;
 }
 
-// ----------------- MongoDB via module -----------------
 const mongoUri = process.env.MONGODB_URI;
 
 io.on('connection', (socket) => {
-  // Per-socket rate limiting using sliding windows
-  const chatLimiter = createRateLimiter({ count: 5, windowMs: 3000 })
-  const drawLimiter = createRateLimiter({ count: 120, windowMs: 3000 })
+  const chatLimiter = createRateLimiter({ count: 5, windowMs: 3000 });
+  const drawLimiter = createRateLimiter({ count: 120, windowMs: 3000 });
+  
   socket.on('create_room', ({ code }) => {
     if (!code) return;
     const raw = String(code || '').trim().toUpperCase();
@@ -164,7 +158,6 @@ io.on('connection', (socket) => {
             io.to(socket.id).emit('chat', { system: true, message: `Room ${raw} already exists.` });
             return;
           }
-          // Create or overwrite ended room with new waiting state
           await roomsCol.updateOne(
             { _id: raw },
             { $set: { _id: raw, phase: 'waiting', createdAt: new Date(), endedAt: null } },
@@ -174,7 +167,6 @@ io.on('connection', (socket) => {
       } catch {}
       const created = createRoom(raw);
       io.to(socket.id).emit('chat', { system: true, message: `Room ${created.code} created.` });
-      // Explicit ack to fix create/join race on the client
       io.to(socket.id).emit('room_created', { code: created.code });
       broadcastRoomState(io, created);
     })();
@@ -187,12 +179,9 @@ io.on('connection', (socket) => {
       io.to(socket.id).emit('error', { code: 'INVALID_ROOM_CODE', room: raw });
       return;
     }
-    // Authentication removed: accept provided name/tgId; ignore initData
 
-    // Validate against DB if available
-    {
-      const roomsCol = getRoomsCol();
-      if (roomsCol) {
+    const roomsCol = getRoomsCol();
+    if (roomsCol) {
       try {
         const r = await roomsCol.findOne({ _id: raw });
         if (!r) {
@@ -207,12 +196,12 @@ io.on('connection', (socket) => {
           return;
         }
       } catch {}
+      
       let room = getRoom(raw);
       if (!room) {
-        // Materialize in-memory room from DB (validated waiting)
         room = createRoom(raw);
       }
-      // Prevent duplicates: if this socket already present, just refresh info
+      
       if (room.players.has(socket.id)) {
         const p = room.players.get(socket.id);
         p.name = name?.slice(0, 24) || p.name;
@@ -222,7 +211,7 @@ io.on('connection', (socket) => {
         broadcastRoomState(io, room);
         return;
       }
-      // If same Telegram user already in room from another session, remove old entry
+      
       if (tgId) {
         for (const [sid, p] of room.players.entries()) {
           if (p.tgId && String(p.tgId) === String(tgId) && sid !== socket.id) {
@@ -231,38 +220,52 @@ io.on('connection', (socket) => {
           }
         }
       }
+      
       if (room.players.size >= MAX_PLAYERS) {
         io.to(socket.id).emit('error', { code: 'ROOM_FULL', room: raw });
         io.to(socket.id).emit('chat', { system: true, message: `Room ${raw} is full.` });
         return;
       }
-      // proceed with join using validated room
+      
       socket.join(raw);
       socket.join(socket.id);
       room.players.set(socket.id, {
-        id: socket.id, name: name?.slice(0, 24) || 'Player', tgId: tgId || null,
-        score: 0, guessed: false
+        id: socket.id, 
+        name: name?.slice(0, 24) || 'Player', 
+        tgId: tgId || null,
+        score: 0, 
+        guessed: false
       });
+      
       try { await ensureUser(tgId || socket.id, name, tgId); } catch {}
+      
+      try {
+        const key = String(tgId || socket.id);
+        if (key && !room.joinedSet.has(key)) {
+          await incrementGamesPlayed(key, 1);
+          room.joinedSet.add(key);
+        }
+      } catch {}
+      
       broadcastRoomState(io, room);
       io.to(raw).emit('chat', { system: true, message: `${name || 'Player'} joined.` });
       return;
     }
-    }
-    // If no DB, use in-memory validation only (never create on join)
+    
     const room = getRoom(raw);
     if (!room) {
       io.to(socket.id).emit('chat', { system: true, message: `Room ${raw} not found. Ask host to create it.` });
       io.to(socket.id).emit('error', { code: 'ROOM_NOT_FOUND', room: raw });
       return;
     }
+    
     if (room.phase !== 'waiting') {
       const reason = room.phase === 'ended' ? 'has ended' : `is not joinable (current phase: ${room.phase})`;
       io.to(socket.id).emit('chat', { system: true, message: `Room ${raw} ${reason}.` });
       io.to(socket.id).emit('error', { code: room.phase === 'ended' ? 'ROOM_ENDED' : 'ROOM_NOT_WAITING', room: raw, phase: room.phase });
       return;
     }
-    // Prevent duplicates: if this socket already present, just refresh info
+    
     if (room.players.has(socket.id)) {
       const p = room.players.get(socket.id);
       p.name = name?.slice(0, 24) || p.name;
@@ -272,7 +275,7 @@ io.on('connection', (socket) => {
       broadcastRoomState(io, room);
       return;
     }
-    // If same Telegram user already in room from another session, remove old entry
+    
     if (tgId) {
       for (const [sid, p] of room.players.entries()) {
         if (p.tgId && String(p.tgId) === String(tgId) && sid !== socket.id) {
@@ -281,19 +284,33 @@ io.on('connection', (socket) => {
         }
       }
     }
+    
     if (room.players.size >= MAX_PLAYERS) {
       io.to(socket.id).emit('error', { code: 'ROOM_FULL', room: raw });
       io.to(socket.id).emit('chat', { system: true, message: `Room ${raw} is full.` });
       return;
     }
+    
     socket.join(raw);
     socket.join(socket.id);
     room.players.set(socket.id, {
-      id: socket.id, name: name?.slice(0, 24) || 'Player', tgId: tgId || null,
-      score: 0, guessed: false
+      id: socket.id, 
+      name: name?.slice(0, 24) || 'Player', 
+      tgId: tgId || null,
+      score: 0, 
+      guessed: false
     });
-    // ensure user exists in DB
+    
     try { await ensureUser(tgId || socket.id, name, tgId); } catch {}
+    
+    try {
+      const key = String(tgId || socket.id);
+      if (key && !room.joinedSet.has(key)) {
+        await incrementGamesPlayed(key, 1);
+        room.joinedSet.add(key);
+      }
+    } catch {}
+    
     broadcastRoomState(io, room);
     io.to(raw).emit('chat', { system: true, message: `${name || 'Player'} joined.` });
   });
@@ -310,18 +327,16 @@ io.on('connection', (socket) => {
   socket.on('start_game', ({ code }) => {
     const room = rooms.get(code);
     if (!room) return;
-    // require at least 2 players to start
     if (room.players.size < 2) return;
     if (room.phase !== 'waiting' && room.phase !== 'ended') return;
     room.round = 1;
     room.drawerIndex = 0;
     room.phase = 'choosing';
-    // Initialize stable player order for rotation
     room.playerOrder = Array.from(room.players.keys());
-    // Attach WORDS directly onto the live room object so domain functions mutate the actual room
     room.WORDS = WORDS;
+    room._turnStartedAt = Date.now();
     startTurn(io, room);
-    io.to(code).emit('game_started', { ok: true })
+    io.to(code).emit('game_started', { ok: true });
   });
 
   socket.on('choose_word', ({ code, word }) => {
@@ -330,8 +345,9 @@ io.on('connection', (socket) => {
     const drawerId = Array.from(room.players.keys())[room.drawerIndex];
     if (socket.id !== drawerId) return;
     if (!room.choices.includes(word)) return;
+    room._turnStartedAt = Date.now();
     beginDrawingPhase(io, room, DEFAULTS, word);
-    io.to(socket.id).emit('word_chosen', { ok: true })
+    io.to(socket.id).emit('word_chosen', { ok: true });
   });
 
   socket.on('draw', ({ code, stroke }) => {
@@ -339,17 +355,18 @@ io.on('connection', (socket) => {
     if (!room || room.phase !== 'drawing') return;
     const drawerId = Array.from(room.players.keys())[room.drawerIndex];
     if (socket.id !== drawerId) return;
-    // rate limit draw events
+    
     if (!drawLimiter.allow()) {
       return;
     }
-    // validate stroke payload
+    
     if (!stroke || typeof stroke !== 'object') return;
     const type = stroke.type;
     const size = Math.max(1, Math.min(16, Number(stroke.size || 4)));
     const color = typeof stroke.color === 'string' && stroke.color.length <= 16 ? stroke.color : '#111111';
     const isNum = (v) => typeof v === 'number' && Number.isFinite(v);
     let valid = false;
+    
     if (type === 'begin') {
       valid = isNum(stroke.x) && isNum(stroke.y);
     } else if (type === 'line') {
@@ -357,6 +374,7 @@ io.on('connection', (socket) => {
     } else if (type === 'clear') {
       valid = true;
     }
+    
     if (!valid) return;
     const safeStroke = { ...stroke, size, color };
     socket.to(code).emit('draw', safeStroke);
@@ -367,11 +385,12 @@ io.on('connection', (socket) => {
     if (!room) return;
     const player = room.players.get(socket.id);
     if (!player) return;
-    // rate limit chat
+    
     if (!chatLimiter.allow()) {
       io.to(socket.id).emit('chat', { system: true, message: 'You are sending messages too fast.' });
       return;
     }
+    
     const text = String(message || '').trim().slice(0, 140);
     if (!text) return;
 
@@ -384,7 +403,6 @@ io.on('connection', (socket) => {
         const drawer = room.players.get(drawerId);
         if (drawer) drawer.score += drawerBonus();
 
-        // persist scores
         try {
           await incrementScore(player.tgId || player.id, guessScore);
           if (drawer) await incrementScore(drawer.tgId || drawer.id, drawerBonus());
@@ -395,7 +413,18 @@ io.on('connection', (socket) => {
         broadcastRoomState(io, room);
 
         if (allGuessed(room)) {
-          endTurn(io, room); // now will always advance to next drawer
+          const minDrawMs = 4000;
+          const elapsed = Date.now() - (room._turnStartedAt || 0);
+          if (elapsed >= minDrawMs) {
+            endTurn(io, room);
+          } else {
+            const delay = Math.max(0, minDrawMs - elapsed);
+            setTimeout(() => {
+              if (room.phase === 'drawing') {
+                try { endTurn(io, room); } catch {}
+              }
+            }, delay);
+          }
         }
         return;
       } else if (!player.guessed && isCloseGuess(text, room.currentWord)) {
@@ -414,7 +443,6 @@ io.on('connection', (socket) => {
         room.players.delete(socket.id);
         io.to(code).emit('chat', { system: true, message: 'A player disconnected.' });
         broadcastRoomState(io, room);
-        // If the drawer disconnected during an active choosing/drawing phase, end the turn early
         if (socket.id === wasDrawerId && (room.phase === 'drawing' || room.phase === 'choosing')) {
           try { endTurn(io, room); } catch {}
         }
