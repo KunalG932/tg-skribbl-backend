@@ -293,17 +293,42 @@ io.on('connection', (socket) => {
           io.to(socket.id).emit('error', { code: 'ROOM_NOT_FOUND', room: raw });
           return;
         }
-        if (r.phase === 'ended') {
-          io.to(socket.id).emit('chat', { system: true, message: `Room ${raw} has ended.` });
-          io.to(socket.id).emit('error', { code: 'ROOM_ENDED', room: raw });
+        if (r.phase !== 'waiting') {
+          const reason = r.phase === 'ended' ? 'has ended' : `is not joinable (current phase: ${r.phase})`;
+          io.to(socket.id).emit('chat', { system: true, message: `Room ${raw} ${reason}.` });
+          io.to(socket.id).emit('error', { code: r.phase === 'ended' ? 'ROOM_ENDED' : 'ROOM_NOT_WAITING', room: raw, phase: r.phase });
           return;
         }
       } catch {}
+      let room = getRoom(raw);
+      if (!room) {
+        // Materialize in-memory room from DB (validated waiting)
+        room = createRoom(raw);
+      }
+      // proceed with join using validated room
+      socket.join(raw);
+      socket.join(socket.id);
+      room.players.set(socket.id, {
+        id: socket.id, name: name?.slice(0, 24) || 'Player', tgId: tgId || null,
+        score: 0, guessed: false
+      });
+      try { await ensureUser(tgId || socket.id, name, tgId); } catch {}
+      broadcastRoomState(room);
+      io.to(raw).emit('chat', { system: true, message: `${name || 'Player'} joined.` });
+      return;
     }
-    let room = getRoom(raw);
+    // If no DB, use in-memory validation only (never create on join)
+    const room = getRoom(raw);
     if (!room) {
-      // Materialize in-memory room from DB (assume waiting)
-      room = createRoom(raw);
+      io.to(socket.id).emit('chat', { system: true, message: `Room ${raw} not found. Ask host to create it.` });
+      io.to(socket.id).emit('error', { code: 'ROOM_NOT_FOUND', room: raw });
+      return;
+    }
+    if (room.phase !== 'waiting') {
+      const reason = room.phase === 'ended' ? 'has ended' : `is not joinable (current phase: ${room.phase})`;
+      io.to(socket.id).emit('chat', { system: true, message: `Room ${raw} ${reason}.` });
+      io.to(socket.id).emit('error', { code: room.phase === 'ended' ? 'ROOM_ENDED' : 'ROOM_NOT_WAITING', room: raw, phase: room.phase });
+      return;
     }
     socket.join(raw);
     socket.join(socket.id);
