@@ -297,7 +297,9 @@ io.on('connection', (socket) => {
     room.round = 1;
     room.drawerIndex = 0;
     room.phase = 'choosing';
-    startTurn(io, { ...room, WORDS });
+    // Attach WORDS directly onto the live room object so domain functions mutate the actual room
+    room.WORDS = WORDS;
+    startTurn(io, room);
     io.to(code).emit('game_started', { ok: true })
   });
 
