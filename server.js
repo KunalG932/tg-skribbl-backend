@@ -41,6 +41,23 @@ app.get('/api/leaderboard', async (_req, res) => {
   }
 });
 
+app.get('/api/rank', async (req, res) => {
+  try {
+    const usersCol = getUsersCol();
+    if (!usersCol) return res.json({ ok: true, rank: null, total: 0 });
+    const tgId = req.query.tgId ? String(req.query.tgId) : null;
+    if (!tgId) return res.json({ ok: true, rank: null, total: 0 });
+    const user = await usersCol.findOne({ _id: tgId }, { projection: { score: 1 } });
+    const total = await usersCol.countDocuments({});
+    if (!user) return res.json({ ok: true, rank: null, total });
+    const greater = await usersCol.countDocuments({ score: { $gt: Number(user.score || 0) } });
+    const rank = greater + 1;
+    return res.json({ ok: true, rank, total });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
 app.get('/api/profile', async (req, res) => {
   try {
     const usersCol = getUsersCol();
