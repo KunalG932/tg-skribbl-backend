@@ -8,7 +8,7 @@ import { buildAllowedOrigins } from './src/config/env.js';
 import { initDb, ensureUser, incrementScore, getRoomsCol, getUsersCol } from './src/db/mongo.js';
 import { WORDS } from './src/domain/words.js';
 import { broadcastRoomState, startTurn, beginDrawingPhase, endTurn, nextTurnOrRound, allGuessed } from './src/domain/rooms.js';
-import { verifyTelegramInitData, extractUserFromInitData } from './src/security/telegram.js';
+// Telegram verification removed: joins and profile no longer require initData
 import { guessScoreForTime, drawerBonus } from './src/domain/scoring.js';
 import { createRateLimiter } from './src/security/rateLimit.js';
 
@@ -46,17 +46,9 @@ app.get('/api/leaderboard', async (_req, res) => {
 
 app.get('/api/profile', async (req, res) => {
   try {
-    const botToken = process.env.TELEGRAM_BOT_TOKEN
     const usersCol = getUsersCol()
     if (!usersCol) return res.json({ ok: true, user: null })
-    let tgId = null
-    if (botToken && req.query.initData) {
-      const v = verifyTelegramInitData(String(req.query.initData), botToken)
-      if (v.ok) tgId = extractUserFromInitData(v.data)?.id || null
-    } else if (req.query.tgId) {
-      // dev fallback
-      tgId = String(req.query.tgId)
-    }
+    const tgId = req.query.tgId ? String(req.query.tgId) : null
     if (!tgId) return res.json({ ok: true, user: null })
     const user = await usersCol.findOne({ _id: String(tgId) }, { projection: { _id: 1, name: 1, score: 1, tgId: 1 } })
     return res.json({ ok: true, user })
@@ -176,23 +168,7 @@ io.on('connection', (socket) => {
       io.to(socket.id).emit('error', { code: 'INVALID_ROOM_CODE', room: raw });
       return;
     }
-    // If BOT token is configured, verify Telegram initData and override identity
-    const botToken = process.env.TELEGRAM_BOT_TOKEN;
-    let verified = null;
-    if (botToken) {
-      const res = verifyTelegramInitData(initData || '', botToken);
-      if (!res.ok) {
-        io.to(socket.id).emit('error', { code: 'AUTH_FAILED' });
-        io.to(socket.id).emit('chat', { system: true, message: 'Authentication failed.' });
-        return;
-      }
-      const u = extractUserFromInitData(res.data);
-      if (u) {
-        tgId = u.id;
-        name = u.name;
-      }
-      verified = u;
-    }
+    // Authentication removed: accept provided name/tgId; ignore initData
 
     // Validate against DB if available
     {
