@@ -31,7 +31,7 @@ app.get('/api/leaderboard', async (_req, res) => {
     const roomsCol = getRoomsCol();
     const usersCol = getUsersCol();
     if (!usersCol) return res.json({ ok: true, users: [] });
-    const top = await usersCol.find({}, { projection: { _id: 1, name: 1, score: 1, tgId: 1, avatarUrl: 1, theme: 1 } })
+    const top = await usersCol.find({}, { projection: { _id: 1, name: 1, score: 1, tgId: 1, avatarUrl: 1 } })
       .sort({ score: -1 })
       .limit(Number(process.env.LEADERBOARD_LIMIT || 20))
       .toArray();
@@ -64,7 +64,7 @@ app.get('/api/profile', async (req, res) => {
     if (!usersCol) return res.json({ ok: true, user: null });
     const tgId = req.query.tgId ? String(req.query.tgId) : null;
     if (!tgId) return res.json({ ok: true, user: null });
-    const user = await usersCol.findOne({ _id: String(tgId) }, { projection: { _id: 1, name: 1, score: 1, tgId: 1, avatarUrl: 1, theme: 1, stats: 1 } });
+    const user = await usersCol.findOne({ _id: String(tgId) }, { projection: { _id: 1, name: 1, score: 1, tgId: 1, avatarUrl: 1, stats: 1 } });
     return res.json({ ok: true, user });
   } catch (e) {
     return res.status(500).json({ ok: false, error: e?.message || String(e) });
@@ -75,19 +75,28 @@ app.post('/api/profile', async (req, res) => {
   try {
     const usersCol = getUsersCol();
     if (!usersCol) return res.json({ ok: true });
-    const { tgId, name, avatarUrl, theme } = req.body || {};
+    const { tgId, name, avatarUrl } = req.body || {};
     if (!tgId) return res.status(400).json({ ok: false, error: 'tgId required' });
     const _id = String(tgId);
     const $set = {};
     if (name) $set.name = String(name).slice(0, 50);
     if (avatarUrl) $set.avatarUrl = String(avatarUrl);
-    if (theme === 'light' || theme === 'dark') $set.theme = theme;
     await usersCol.updateOne({ _id }, { $set: { _id, tgId: _id, ...$set } }, { upsert: true });
     return res.json({ ok: true });
   } catch (e) {
     return res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 });
+
+// On startup, cleanup any persisted theme fields from users collection
+(async () => {
+  try {
+    const usersCol = getUsersCol();
+    if (usersCol) {
+      await usersCol.updateMany({ theme: { $exists: true } }, { $unset: { theme: '' } });
+    }
+  } catch {}
+})();
 
 const server = http.createServer(app);
 const io = new Server(server, {
