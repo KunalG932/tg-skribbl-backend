@@ -5,8 +5,7 @@ import cors from 'cors';
 import { Server } from 'socket.io';
 import { buildAllowedOrigins } from './src/config/env.js';
 import { initDb, ensureUser, incrementScore, getRoomsCol, getUsersCol, incrementGamesPlayed, addToTotalScore } from './src/db/mongo.js';
-import { WORDS } from './src/domain/words.js';
-import { broadcastRoomState, startTurn, beginDrawingPhase, endTurn, nextTurnOrRound, allGuessed } from './src/domain/rooms.js';
+import { broadcastRoomState, startTurn, beginDrawingPhase, endTurn, nextTurnOrRound, allGuessed, clearRoomTimers } from './src/domain/rooms.js';
 import { guessScoreForTime, drawerBonus } from './src/domain/scoring.js';
 import { createRateLimiter } from './src/security/rateLimit.js';
 
@@ -113,12 +112,30 @@ const io = new Server(server, {
 const rooms = new Map();
 const DEFAULTS = { roundTime: 75, maxRounds: 3 };
 const MAX_PLAYERS = Number(process.env.MAX_PLAYERS || 12);
+const ROOM_CLEANUP_MS = 60000; // delete ended rooms after 60s
+
+setInterval(() => {
+  try {
+    for (const [code, room] of rooms.entries()) {
+      if (room && room.phase === 'ended') {
+        try { clearRoomTimers(room); } catch {}
+        rooms.delete(code);
+      }
+    }
+  } catch {}
+}, ROOM_CLEANUP_MS);
 
 function isCloseGuess(guess, word) {
-  const a = guess.toLowerCase().trim();
-  const b = word.toLowerCase().trim();
+  let a = guess.toLowerCase().trim();
+  let b = word.toLowerCase().trim();
   if (!a || !b) return false;
+  // Early exit: large length difference relative to answer
   const maxClose = Math.max(1, Math.floor(b.length * 0.25));
+  if (Math.abs(a.length - b.length) > maxClose) return false;
+  // Limit computation cost
+  const MAX_LEN = 40;
+  if (a.length > MAX_LEN) a = a.slice(0, MAX_LEN);
+  if (b.length > MAX_LEN) b = b.slice(0, MAX_LEN);
   const dp = Array(b.length + 1).fill(0);
   for (let j = 0; j <= b.length; j++) dp[j] = j;
   for (let i = 1; i <= a.length; i++) {
@@ -165,12 +182,19 @@ const mongoUri = process.env.MONGODB_URI;
 io.on('connection', (socket) => {
   const chatLimiter = createRateLimiter({ count: 5, windowMs: 3000 });
   const drawLimiter = createRateLimiter({ count: 120, windowMs: 3000 });
+  const roomCreateLimiter = createRateLimiter({ count: 3, windowMs: 10000 });
+  const roomJoinLimiter = createRateLimiter({ count: 5, windowMs: 5000 });
+  const startGameLimiter = createRateLimiter({ count: 2, windowMs: 10000 });
   
   socket.on('create_room', ({ code }) => {
+    if (!roomCreateLimiter.allow()) {
+      io.to(socket.id).emit('chat', { system: true, message: 'Slow down: creating rooms too fast.' });
+      return;
+    }
     if (!code) return;
     const raw = String(code || '').trim().toUpperCase();
     if (!/^[A-Z0-9]{4}$/.test(raw)) {
-      io.to(socket.id).emit('error', { code: 'INVALID_ROOM_CODE', room: raw });
+      io.to(socket.id).emit('app_error', { code: 'INVALID_ROOM_CODE', room: raw });
       io.to(socket.id).emit('chat', { system: true, message: 'Invalid room code. Use 4 letters/numbers (e.g., AB1C).' });
       return;
     }
@@ -180,7 +204,7 @@ io.on('connection', (socket) => {
         if (roomsCol) {
           const r = await roomsCol.findOne({ _id: raw });
           if (r && r.phase !== 'ended') {
-            io.to(socket.id).emit('error', { code: 'ROOM_EXISTS', room: raw });
+            io.to(socket.id).emit('app_error', { code: 'ROOM_EXISTS', room: raw });
             io.to(socket.id).emit('chat', { system: true, message: `Room ${raw} already exists.` });
             return;
           }
@@ -199,10 +223,14 @@ io.on('connection', (socket) => {
   });
 
   socket.on('join_room', async ({ code, name, tgId, initData }) => {
+    if (!roomJoinLimiter.allow()) {
+      io.to(socket.id).emit('chat', { system: true, message: 'Slow down: joining too fast.' });
+      return;
+    }
     const raw = String(code || '').trim().toUpperCase();
     if (!/^[A-Z0-9]{4}$/.test(raw)) {
+      io.to(socket.id).emit('app_error', { code: 'INVALID_ROOM_CODE', room: raw });
       io.to(socket.id).emit('chat', { system: true, message: 'Invalid room code. Use 4 letters/numbers (e.g., AB1C).' });
-      io.to(socket.id).emit('error', { code: 'INVALID_ROOM_CODE', room: raw });
       return;
     }
 
@@ -212,13 +240,13 @@ io.on('connection', (socket) => {
         const r = await roomsCol.findOne({ _id: raw });
         if (!r) {
           io.to(socket.id).emit('chat', { system: true, message: `Room ${raw} not found. Ask host to create it.` });
-          io.to(socket.id).emit('error', { code: 'ROOM_NOT_FOUND', room: raw });
+          io.to(socket.id).emit('app_error', { code: 'ROOM_NOT_FOUND', room: raw });
           return;
         }
         if (r.phase !== 'waiting') {
           const reason = r.phase === 'ended' ? 'has ended' : `is not joinable (current phase: ${r.phase})`;
           io.to(socket.id).emit('chat', { system: true, message: `Room ${raw} ${reason}.` });
-          io.to(socket.id).emit('error', { code: r.phase === 'ended' ? 'ROOM_ENDED' : 'ROOM_NOT_WAITING', room: raw, phase: r.phase });
+          io.to(socket.id).emit('app_error', { code: r.phase === 'ended' ? 'ROOM_ENDED' : 'ROOM_NOT_WAITING', room: raw, phase: r.phase });
           return;
         }
       } catch {}
@@ -248,7 +276,7 @@ io.on('connection', (socket) => {
       }
       
       if (room.players.size >= MAX_PLAYERS) {
-        io.to(socket.id).emit('error', { code: 'ROOM_FULL', room: raw });
+        io.to(socket.id).emit('app_error', { code: 'ROOM_FULL', room: raw });
         io.to(socket.id).emit('chat', { system: true, message: `Room ${raw} is full.` });
         return;
       }
@@ -264,14 +292,15 @@ io.on('connection', (socket) => {
       });
       
       try { await ensureUser(tgId || socket.id, name, tgId); } catch {}
-      
-      try {
-        const key = String(tgId || socket.id);
-        if (key && !room.joinedSet.has(key)) {
-          await incrementGamesPlayed(key, 1);
-          room.joinedSet.add(key);
+      // Late-join policy: include joiner in current game's order
+      if (room.phase !== 'waiting' && room.phase !== 'ended') {
+        const order = Array.isArray(room.playerOrder) ? room.playerOrder : Array.from(room.players.keys());
+        if (!order.includes(socket.id)) {
+          const insertAt = (room.drawerIndex + 1) % (order.length + 1);
+          order.splice(insertAt, 0, socket.id);
+          room.playerOrder = order;
         }
-      } catch {}
+      }
       
       broadcastRoomState(io, room);
       io.to(raw).emit('chat', { system: true, message: `${name || 'Player'} joined.` });
@@ -281,7 +310,7 @@ io.on('connection', (socket) => {
     const room = getRoom(raw);
     if (!room) {
       io.to(socket.id).emit('chat', { system: true, message: `Room ${raw} not found. Ask host to create it.` });
-      io.to(socket.id).emit('error', { code: 'ROOM_NOT_FOUND', room: raw });
+      io.to(socket.id).emit('app_error', { code: 'ROOM_NOT_FOUND', room: raw });
       return;
     }
     
@@ -312,7 +341,7 @@ io.on('connection', (socket) => {
     }
     
     if (room.players.size >= MAX_PLAYERS) {
-      io.to(socket.id).emit('error', { code: 'ROOM_FULL', room: raw });
+      io.to(socket.id).emit('app_error', { code: 'ROOM_FULL', room: raw });
       io.to(socket.id).emit('chat', { system: true, message: `Room ${raw} is full.` });
       return;
     }
@@ -328,14 +357,15 @@ io.on('connection', (socket) => {
     });
     
     try { await ensureUser(tgId || socket.id, name, tgId); } catch {}
-    
-    try {
-      const key = String(tgId || socket.id);
-      if (key && !room.joinedSet.has(key)) {
-        await incrementGamesPlayed(key, 1);
-        room.joinedSet.add(key);
+    // Late-join policy: include joiner in current game's order
+    if (room.phase !== 'waiting' && room.phase !== 'ended') {
+      const order = Array.isArray(room.playerOrder) ? room.playerOrder : Array.from(room.players.keys());
+      if (!order.includes(socket.id)) {
+        const insertAt = (room.drawerIndex + 1) % (order.length + 1);
+        order.splice(insertAt, 0, socket.id);
+        room.playerOrder = order;
       }
-    } catch {}
+    }
     
     broadcastRoomState(io, room);
     io.to(raw).emit('chat', { system: true, message: `${name || 'Player'} joined.` });
@@ -348,9 +378,18 @@ io.on('connection', (socket) => {
     socket.leave(code);
     io.to(code).emit('chat', { system: true, message: 'A player left.' });
     broadcastRoomState(io, room);
+    // Cleanup: delete room if empty
+    if (room.players.size === 0) {
+      try { clearRoomTimers(room); } catch {}
+      rooms.delete(code);
+    }
   });
 
   socket.on('start_game', ({ code }) => {
+    if (!startGameLimiter.allow()) {
+      io.to(socket.id).emit('chat', { system: true, message: 'Slow down: starting games too fast.' });
+      return;
+    }
     const room = rooms.get(code);
     if (!room) return;
     if (room.players.size < 2) return;
@@ -359,7 +398,6 @@ io.on('connection', (socket) => {
     room.drawerIndex = 0;
     room.phase = 'choosing';
     room.playerOrder = Array.from(room.players.keys());
-    room.WORDS = WORDS;
     room._turnStartedAt = Date.now();
     startTurn(io, room);
     io.to(code).emit('game_started', { ok: true });
@@ -431,7 +469,12 @@ io.on('connection', (socket) => {
 
         try {
           await incrementScore(player.tgId || player.id, guessScore);
-          if (drawer) await incrementScore(drawer.tgId || drawer.id, drawerBonus());
+          await addToTotalScore(player.tgId || player.id, guessScore);
+          if (drawer) {
+            const bonus = drawerBonus();
+            await incrementScore(drawer.tgId || drawer.id, bonus);
+            await addToTotalScore(drawer.tgId || drawer.id, bonus);
+          }
         } catch {}
 
         io.to(socket.id).emit('chat', { system: true, message: 'You guessed the word!' });
@@ -458,7 +501,8 @@ io.on('connection', (socket) => {
         return;
       }
     }
-    io.to(code).emit('chat', { name: name || player.name, message: text });
+    // Prevent name spoofing: always use server-side player.name
+    io.to(code).emit('chat', { name: player.name, message: text });
   });
 
   socket.on('disconnecting', () => {
@@ -471,6 +515,11 @@ io.on('connection', (socket) => {
         broadcastRoomState(io, room);
         if (socket.id === wasDrawerId && (room.phase === 'drawing' || room.phase === 'choosing')) {
           try { endTurn(io, room); } catch {}
+        }
+        // Cleanup: delete room if empty
+        if (room.players.size === 0) {
+          try { clearRoomTimers(room); } catch {}
+          rooms.delete(code);
         }
       }
     }

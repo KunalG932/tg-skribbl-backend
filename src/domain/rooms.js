@@ -1,5 +1,6 @@
-import { randomChoices, maskWord } from './words.js';
+import { getRandomChoices, maskWord } from './words.js';
 import { revealHintOverTime } from './hints.js';
+import { incrementGamesPlayed } from '../db/mongo.js';
 
 export function broadcastRoomState(io, room) {
   const players = Array.from(room.players.values()).map(p => ({
@@ -47,12 +48,20 @@ export function startTurn(io, room) {
   room.phase = 'choosing';
   room.currentWord = null;
   room.hint = null;
-  room.choices = randomChoices(room.WORDS || [], 3);
-  const order = Array.isArray(room.playerOrder) ? room.playerOrder : Array.from(room.players.keys());
-  const drawerId = order[room.drawerIndex];
-  io.to(room.code).emit('turn_start', { drawerId });
-  io.to(drawerId).emit('word_choices', room.choices);
-  room.players.forEach(p => { p.guessed = false; });
+  // Fetch fresh choices dynamically each turn to reflect updated word cache
+  // Note: this is async; emit choices once available
+  (async () => {
+    try {
+      room.choices = await getRandomChoices(3);
+    } catch {
+      room.choices = room.choices && room.choices.length ? room.choices : ['cat','dog','tree'];
+    }
+    const order = Array.isArray(room.playerOrder) ? room.playerOrder : Array.from(room.players.keys());
+    const drawerId = order[room.drawerIndex];
+    io.to(room.code).emit('turn_start', { drawerId });
+    io.to(drawerId).emit('word_choices', room.choices);
+    room.players.forEach(p => { p.guessed = false; });
+  })();
 }
 
 export function beginDrawingPhase(io, room, defaults, word) {
@@ -65,11 +74,15 @@ export function beginDrawingPhase(io, room, defaults, word) {
   room.timer = Math.max(20, Math.round(base * m));
   io.to(room.code).emit('hint_update', room.hint);
   broadcastRoomState(io, room);
-  revealHintOverTime(io, room, defaults);
+  // Clear any existing timers before starting new ones
+  if (room._hintHandle) { try { clearInterval(room._hintHandle); } catch {} }
+  if (room._tickHandle) { try { clearInterval(room._tickHandle); } catch {} }
+  room._hintHandle = revealHintOverTime(io, room, defaults);
 
   const tick = setInterval(() => {
     if (room.phase !== 'drawing') { 
       clearInterval(tick); 
+      if (room._tickHandle === tick) room._tickHandle = null;
       return; 
     }
     room.timer -= 1;
@@ -80,11 +93,15 @@ export function beginDrawingPhase(io, room, defaults, word) {
       endTurn(io, room);
     }
   }, 1000);
+  room._tickHandle = tick;
 }
 
 export function endTurn(io, room) {
   room.phase = 'intermission';
   io.to(room.code).emit('turn_end', { word: room.currentWord });
+  // Proactively clear timers to avoid leaks while in intermission
+  if (room._tickHandle) { try { clearInterval(room._tickHandle); } catch {} finally { room._tickHandle = null } }
+  if (room._hintHandle) { try { clearInterval(room._hintHandle); } catch {} finally { room._hintHandle = null } }
   setTimeout(() => nextTurnOrRound(io, room), 3000);
 }
 
@@ -108,8 +125,28 @@ export function nextTurnOrRound(io, room) {
       score: p.score
     }));
     io.to(room.code).emit('game_over', { scores: finalScores });
+    // Persist gamesPlayed for all participants
+    (async () => {
+      try {
+        const uniq = new Set();
+        for (const p of room.players.values()) {
+          const key = String(p.tgId || p.id);
+          if (!uniq.has(key)) {
+            uniq.add(key);
+            await incrementGamesPlayed(key, 1);
+          }
+        }
+      } catch {}
+    })();
     return { ended: true, finalScores };
   }
   startTurn(io, room);
   return { ended: false };
+}
+
+export function clearRoomTimers(room) {
+  try { if (room._tickHandle) clearInterval(room._tickHandle); } catch {}
+  try { if (room._hintHandle) clearInterval(room._hintHandle); } catch {}
+  room._tickHandle = null;
+  room._hintHandle = null;
 }
