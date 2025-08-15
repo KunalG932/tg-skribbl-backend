@@ -114,6 +114,19 @@ const DEFAULTS = { roundTime: 75, maxRounds: 3 };
 const MAX_PLAYERS = Number(process.env.MAX_PLAYERS || 12);
 const ROOM_CLEANUP_MS = 60000; // delete ended rooms after 60s
 
+// Helper: apply late-join policy consistently
+function applyLateJoinPolicy(room, socketId) {
+  if (!room) return;
+  if (room.phase !== 'waiting' && room.phase !== 'ended') {
+    const order = Array.isArray(room.playerOrder) ? room.playerOrder : Array.from(room.players.keys());
+    if (!order.includes(socketId)) {
+      const insertAt = (room.drawerIndex + 1) % (order.length + 1);
+      order.splice(insertAt, 0, socketId);
+      room.playerOrder = order;
+    }
+  }
+}
+
 setInterval(() => {
   try {
     for (const [code, room] of rooms.entries()) {
@@ -293,14 +306,7 @@ io.on('connection', (socket) => {
       
       try { await ensureUser(tgId || socket.id, name, tgId); } catch {}
       // Late-join policy: include joiner in current game's order
-      if (room.phase !== 'waiting' && room.phase !== 'ended') {
-        const order = Array.isArray(room.playerOrder) ? room.playerOrder : Array.from(room.players.keys());
-        if (!order.includes(socket.id)) {
-          const insertAt = (room.drawerIndex + 1) % (order.length + 1);
-          order.splice(insertAt, 0, socket.id);
-          room.playerOrder = order;
-        }
-      }
+      applyLateJoinPolicy(room, socket.id);
       
       broadcastRoomState(io, room);
       io.to(raw).emit('chat', { system: true, message: `${name || 'Player'} joined.` });
@@ -358,14 +364,7 @@ io.on('connection', (socket) => {
     
     try { await ensureUser(tgId || socket.id, name, tgId); } catch {}
     // Late-join policy: include joiner in current game's order
-    if (room.phase !== 'waiting' && room.phase !== 'ended') {
-      const order = Array.isArray(room.playerOrder) ? room.playerOrder : Array.from(room.players.keys());
-      if (!order.includes(socket.id)) {
-        const insertAt = (room.drawerIndex + 1) % (order.length + 1);
-        order.splice(insertAt, 0, socket.id);
-        room.playerOrder = order;
-      }
-    }
+    applyLateJoinPolicy(room, socket.id);
     
     broadcastRoomState(io, room);
     io.to(raw).emit('chat', { system: true, message: `${name || 'Player'} joined.` });
@@ -425,23 +424,41 @@ io.on('connection', (socket) => {
     }
     
     if (!stroke || typeof stroke !== 'object') return;
-    const type = stroke.type;
-    const size = Math.max(1, Math.min(16, Number(stroke.size || 4)));
-    const color = typeof stroke.color === 'string' && stroke.color.length <= 16 ? stroke.color : '#111111';
+    const type = typeof stroke.type === 'string' ? stroke.type : '';
+    const allowedTypes = new Set(['begin', 'line', 'clear']);
+    if (!allowedTypes.has(type)) return;
+
     const isNum = (v) => typeof v === 'number' && Number.isFinite(v);
+    const inRange = (v) => isNum(v) && v >= -10000 && v <= 10000; // bound coords
+    const size = Math.max(1, Math.min(16, Number(stroke.size || 4)));
+    const colorRaw = typeof stroke.color === 'string' ? stroke.color.slice(0, 16) : '#111111';
+    const hexColor = /^#?[0-9A-Fa-f]{3,8}$/.test(colorRaw) ? (colorRaw.startsWith('#') ? colorRaw : '#' + colorRaw) : '#111111';
+
     let valid = false;
-    
+    let payload = { type };
+
     if (type === 'begin') {
-      valid = isNum(stroke.x) && isNum(stroke.y);
+      if (inRange(stroke.x) && inRange(stroke.y)) {
+        valid = true;
+        payload.x = Number(stroke.x);
+        payload.y = Number(stroke.y);
+      }
     } else if (type === 'line') {
-      valid = isNum(stroke.x1) && isNum(stroke.y1) && isNum(stroke.x2) && isNum(stroke.y2);
+      if (inRange(stroke.x1) && inRange(stroke.y1) && inRange(stroke.x2) && inRange(stroke.y2)) {
+        valid = true;
+        payload.x1 = Number(stroke.x1);
+        payload.y1 = Number(stroke.y1);
+        payload.x2 = Number(stroke.x2);
+        payload.y2 = Number(stroke.y2);
+      }
     } else if (type === 'clear') {
       valid = true;
     }
-    
+
     if (!valid) return;
-    const safeStroke = { ...stroke, size, color };
-    socket.to(code).emit('draw', safeStroke);
+    payload.size = size;
+    payload.color = hexColor;
+    socket.to(code).emit('draw', payload);
   });
 
   socket.on('chat', async ({ code, message, name }) => {
@@ -532,6 +549,17 @@ const port = process.env.PORT || 3000;
     await initDb(mongoUri, process.env.MONGODB_DB || 'scribbly');
   } catch (e) {
     console.warn('MongoDB init failed:', e?.message || e);
+  }
+  // Reconcile room states in Mongo to avoid stale non-waiting phases after crashes
+  try {
+    const roomsCol = getRoomsCol();
+    if (roomsCol) {
+      // Any room not ended should be set to waiting on startup
+      await roomsCol.updateMany({ phase: { $nin: ['waiting', 'ended'] } }, { $set: { phase: 'waiting' } });
+      // Optionally end very old rooms with endedAt far in the past is handled by TTL index in db setup
+    }
+  } catch (e) {
+    console.warn('Room reconciliation failed:', e?.message || e);
   }
   server.listen(port, () => {
     console.log(`Server listening on :${port}`);

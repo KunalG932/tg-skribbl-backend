@@ -16,6 +16,13 @@ export async function initDb(uri, dbName = 'scribbly') {
   await usersCol.createIndex({ _id: 1 })
   roomsCol = db.collection('rooms')
   await roomsCol.createIndex({ _id: 1 })
+  // TTL index for automatic cleanup of ended rooms after 24 hours
+  try {
+    await roomsCol.createIndex(
+      { endedAt: 1 },
+      { expireAfterSeconds: 86400, partialFilterExpression: { endedAt: { $type: 'date' } } }
+    )
+  } catch {}
   console.log('Connected to MongoDB')
   return { ok: true }
 }
