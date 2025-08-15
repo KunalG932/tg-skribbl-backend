@@ -85,6 +85,7 @@ export function beginDrawingPhase(io, room, defaults, word) {
   // Clear any existing timers before starting new ones
   if (room._hintHandle) { try { clearInterval(room._hintHandle); } catch {} }
   if (room._tickHandle) { try { clearInterval(room._tickHandle); } catch {} }
+  if (room._intermissionHandle) { try { clearTimeout(room._intermissionHandle); } catch {} finally { room._intermissionHandle = null } }
   room._hintHandle = revealHintOverTime(io, room, defaults);
 
   const tick = setInterval(() => {
@@ -114,10 +115,12 @@ export function endTurn(io, room) {
   // Proactively clear timers to avoid leaks while in intermission
   if (room._tickHandle) { try { clearInterval(room._tickHandle); } catch {} finally { room._tickHandle = null } }
   if (room._hintHandle) { try { clearInterval(room._hintHandle); } catch {} finally { room._hintHandle = null } }
-  setTimeout(() => nextTurnOrRound(io, room), 3000);
+  if (room._intermissionHandle) { try { clearTimeout(room._intermissionHandle); } catch {} }
+  room._intermissionHandle = setTimeout(() => nextTurnOrRound(io, room), 3000);
 }
 
 export function nextTurnOrRound(io, room) {
+  if (room.phase === 'ended') return { ended: true };
   // Normalize player order to existing sockets
   const currentIds = new Set(room.players.keys());
   const baseOrder = Array.isArray(room.playerOrder) ? room.playerOrder : Array.from(room.players.keys());
@@ -201,6 +204,8 @@ export function nextTurnOrRound(io, room) {
 export function clearRoomTimers(room) {
   try { if (room._tickHandle) clearInterval(room._tickHandle); } catch {}
   try { if (room._hintHandle) clearInterval(room._hintHandle); } catch {}
+  try { if (room._intermissionHandle) clearTimeout(room._intermissionHandle); } catch {}
   room._tickHandle = null;
   room._hintHandle = null;
+  room._intermissionHandle = null;
 }

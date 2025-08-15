@@ -375,7 +375,6 @@ io.on('connection', (socket) => {
       try { await ensureUser(tgId || socket.id, name, tgId); } catch {}
       // Late-join policy: include joiner in current game's order
       applyLateJoinPolicy(room, socket.id);
-      addToPlayerOrderAfterDrawer(room, socket.id);
       
       broadcastRoomState(io, room);
       io.to(raw).emit('chat', { system: true, message: `${name || 'Player'} joined.` });
@@ -434,7 +433,6 @@ io.on('connection', (socket) => {
     try { await ensureUser(tgId || socket.id, name, tgId); } catch {}
     // Late-join policy: include joiner in current game's order
     applyLateJoinPolicy(room, socket.id);
-    addToPlayerOrderAfterDrawer(room, socket.id);
     
     broadcastRoomState(io, room);
     io.to(raw).emit('chat', { system: true, message: `${name || 'Player'} joined.` });
