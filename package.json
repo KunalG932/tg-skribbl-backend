@@ -5,14 +5,15 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "NODE_ENV=development node server.js"
+    "dev": "cross-env NODE_ENV=development node server.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.19.2",
     "socket.io": "^4.7.5",
     "dotenv": "^16.4.5",
-    "mongodb": "^6.8.0"
+    "mongodb": "^6.8.0",
+    "cross-env": "^7.0.3"
   },
   "engines": {
     "node": ">=18"

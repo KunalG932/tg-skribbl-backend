@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import crypto from 'crypto';
 import express from 'express';
 import http from 'http';
 import cors from 'cors';
@@ -12,11 +13,16 @@ import { createRateLimiter } from './src/security/rateLimit.js';
 const app = express();
 
 const allowedOrigins = buildAllowedOrigins(process.env.NODE_ENV, process.env.ALLOWED_ORIGINS);
+const normalizeOrigin = (o) => {
+  try { return new URL(o).origin; } catch { return String(o || '').replace(/\/$/, ''); }
+};
+const allowedOriginSet = new Set(allowedOrigins.map(normalizeOrigin));
 
 app.use(cors({
   origin: (origin, cb) => {
     if (!origin) return cb(null, true);
-    if (allowedOrigins.includes(origin)) return cb(null, true);
+    const normalized = normalizeOrigin(origin);
+    if (allowedOriginSet.has(normalized)) return cb(null, true);
     return cb(new Error('CORS not allowed for origin: ' + origin));
   },
   methods: ['GET','POST'],
@@ -102,7 +108,8 @@ const io = new Server(server, {
   cors: {
     origin: (origin, cb) => {
       if (!origin) return cb(null, true);
-      if (allowedOrigins.includes(origin)) return cb(null, true);
+      const normalized = normalizeOrigin(origin);
+      if (allowedOriginSet.has(normalized)) return cb(null, true);
       return cb(new Error('Socket.IO CORS not allowed: ' + origin));
     },
     methods: ['GET', 'POST'],
@@ -185,9 +192,58 @@ function createRoom(code) {
     timer: 0,
     choices: [],
     joinedSet: new Set(),
+    hostId: null,
   };
   rooms.set(code, room);
   return room;
+}
+
+function normalizeDrawerIndex(room) {
+  const len = Array.isArray(room.playerOrder) ? room.playerOrder.length : room.players.size;
+  if (len <= 0) {
+    room.drawerIndex = 0;
+  } else if (room.drawerIndex >= len) {
+    room.drawerIndex = room.drawerIndex % len;
+  } else if (room.drawerIndex < 0) {
+    room.drawerIndex = 0;
+  }
+}
+
+function removeFromPlayerOrder(room, socketId) {
+  const order = Array.isArray(room.playerOrder) ? room.playerOrder : null;
+  if (!order) return;
+  const idx = order.indexOf(socketId);
+  if (idx !== -1) {
+    order.splice(idx, 1);
+    // If removed index is before or equal current drawerIndex, shift left
+    if (room.drawerIndex >= idx) room.drawerIndex = Math.max(0, room.drawerIndex - 1);
+    room.playerOrder = order;
+  }
+  normalizeDrawerIndex(room);
+}
+
+function addToPlayerOrderAfterDrawer(room, socketId) {
+  const order = Array.isArray(room.playerOrder) ? room.playerOrder : [];
+  const insertAt = ((room.drawerIndex || 0) + 1) % (order.length + 1);
+  order.splice(insertAt, 0, socketId);
+  room.playerOrder = order;
+  normalizeDrawerIndex(room);
+}
+
+function verifyTelegramInitData(initData, botToken) {
+  try {
+    if (!initData || !botToken) return false;
+    const params = new URLSearchParams(initData);
+    const hash = params.get('hash');
+    params.delete('hash');
+    const data = Array.from(params.entries())
+      .map(([k, v]) => `${k}=${v}`)
+      .sort()
+      .join('\n');
+    const secret = crypto.createHash('sha256').update(botToken).digest();
+    const hmac = crypto.createHmac('sha256', secret).update(data).digest('hex');
+    return hmac === hash;
+  } catch { return false; }
 }
 
 const mongoUri = process.env.MONGODB_URI;
@@ -229,6 +285,7 @@ io.on('connection', (socket) => {
         }
       } catch {}
       const created = createRoom(raw);
+      if (!created.hostId) created.hostId = socket.id;
       io.to(socket.id).emit('chat', { system: true, message: `Room ${created.code} created.` });
       io.to(socket.id).emit('room_created', { code: created.code });
       broadcastRoomState(io, created);
@@ -245,6 +302,17 @@ io.on('connection', (socket) => {
       io.to(socket.id).emit('app_error', { code: 'INVALID_ROOM_CODE', room: raw });
       io.to(socket.id).emit('chat', { system: true, message: 'Invalid room code. Use 4 letters/numbers (e.g., AB1C).' });
       return;
+    }
+
+    // Optional Telegram auth enforcement: if bot token is configured, require valid initData
+    const botToken = process.env.TG_BOT_TOKEN;
+    if (botToken) {
+      const ok = verifyTelegramInitData(initData, botToken);
+      if (!ok) {
+        io.to(socket.id).emit('app_error', { code: 'AUTH_FAILED' });
+        io.to(socket.id).emit('chat', { system: true, message: 'Authentication failed. Please open inside Telegram.' });
+        return;
+      }
     }
 
     const roomsCol = getRoomsCol();
@@ -307,6 +375,7 @@ io.on('connection', (socket) => {
       try { await ensureUser(tgId || socket.id, name, tgId); } catch {}
       // Late-join policy: include joiner in current game's order
       applyLateJoinPolicy(room, socket.id);
+      addToPlayerOrderAfterDrawer(room, socket.id);
       
       broadcastRoomState(io, room);
       io.to(raw).emit('chat', { system: true, message: `${name || 'Player'} joined.` });
@@ -323,7 +392,7 @@ io.on('connection', (socket) => {
     if (room.phase !== 'waiting') {
       const reason = room.phase === 'ended' ? 'has ended' : `is not joinable (current phase: ${room.phase})`;
       io.to(socket.id).emit('chat', { system: true, message: `Room ${raw} ${reason}.` });
-      io.to(socket.id).emit('error', { code: room.phase === 'ended' ? 'ROOM_ENDED' : 'ROOM_NOT_WAITING', room: raw, phase: room.phase });
+      io.to(socket.id).emit('app_error', { code: room.phase === 'ended' ? 'ROOM_ENDED' : 'ROOM_NOT_WAITING', room: raw, phase: room.phase });
       return;
     }
     
@@ -365,23 +434,66 @@ io.on('connection', (socket) => {
     try { await ensureUser(tgId || socket.id, name, tgId); } catch {}
     // Late-join policy: include joiner in current game's order
     applyLateJoinPolicy(room, socket.id);
+    addToPlayerOrderAfterDrawer(room, socket.id);
     
     broadcastRoomState(io, room);
     io.to(raw).emit('chat', { system: true, message: `${name || 'Player'} joined.` });
   });
 
-  socket.on('leave_room', ({ code }) => {
+  socket.on('leave_room', async ({ code }) => {
     const room = rooms.get(code);
     if (!room) return;
     room.players.delete(socket.id);
+    removeFromPlayerOrder(room, socket.id);
     socket.leave(code);
     io.to(code).emit('chat', { system: true, message: 'A player left.' });
     broadcastRoomState(io, room);
     // Cleanup: delete room if empty
     if (room.players.size === 0) {
       try { clearRoomTimers(room); } catch {}
+      try {
+        const roomsCol = getRoomsCol();
+        if (roomsCol) await roomsCol.updateOne({ _id: code }, { $set: { phase: 'ended', endedAt: new Date() } });
+      } catch {}
       rooms.delete(code);
     }
+  });
+
+  // Allow host to explicitly close a room
+  socket.on('close_room', async ({ code }) => {
+    try {
+      const raw = String(code || '').trim().toUpperCase();
+      if (!/^[A-Z0-9]{4}$/.test(raw)) {
+        io.to(socket.id).emit('app_error', { code: 'INVALID_ROOM_CODE', room: raw });
+        return;
+      }
+      const room = rooms.get(raw);
+      if (!room) {
+        io.to(socket.id).emit('app_error', { code: 'ROOM_NOT_FOUND', room: raw });
+        return;
+      }
+      // Only host may close the room (fallback: must be in room)
+      if (room.hostId && socket.id !== room.hostId) {
+        io.to(socket.id).emit('app_error', { code: 'NOT_HOST', room: raw });
+        return;
+      }
+      if (!room.players.has(socket.id)) {
+        io.to(socket.id).emit('app_error', { code: 'NOT_IN_ROOM', room: raw });
+        return;
+      }
+      // Mark ended in memory
+      room.phase = 'ended';
+      try { clearRoomTimers(room); } catch {}
+      // Persist ended status if Mongo is configured
+      try {
+        const roomsCol = getRoomsCol();
+        if (roomsCol) {
+          await roomsCol.updateOne({ _id: raw }, { $set: { phase: 'ended', endedAt: new Date() } });
+        }
+      } catch {}
+      io.to(raw).emit('chat', { system: true, message: `Room ${raw} was closed by host.` });
+      broadcastRoomState(io, room);
+    } catch {}
   });
 
   socket.on('start_game', ({ code }) => {
@@ -392,7 +504,7 @@ io.on('connection', (socket) => {
     const room = rooms.get(code);
     if (!room) return;
     if (room.players.size < 2) return;
-    if (room.phase !== 'waiting' && room.phase !== 'ended') return;
+    if (room.phase !== 'waiting') return;
     room.round = 1;
     room.drawerIndex = 0;
     room.phase = 'choosing';
@@ -482,13 +594,13 @@ io.on('connection', (socket) => {
         player.score += guessScore;
         const drawerId = Array.from(room.players.keys())[room.drawerIndex];
         const drawer = room.players.get(drawerId);
-        if (drawer) drawer.score += drawerBonus();
+        const bonus = drawerBonus();
+        if (drawer) drawer.score += bonus;
 
         try {
           await incrementScore(player.tgId || player.id, guessScore);
           await addToTotalScore(player.tgId || player.id, guessScore);
           if (drawer) {
-            const bonus = drawerBonus();
             await incrementScore(drawer.tgId || drawer.id, bonus);
             await addToTotalScore(drawer.tgId || drawer.id, bonus);
           }
@@ -522,12 +634,13 @@ io.on('connection', (socket) => {
     io.to(code).emit('chat', { name: player.name, message: text });
   });
 
-  socket.on('disconnecting', () => {
+  socket.on('disconnecting', async () => {
     for (const code of socket.rooms) {
       if (rooms.has(code)) {
         const room = rooms.get(code);
         const wasDrawerId = Array.from(room.players.keys())[room.drawerIndex];
         room.players.delete(socket.id);
+        removeFromPlayerOrder(room, socket.id);
         io.to(code).emit('chat', { system: true, message: 'A player disconnected.' });
         broadcastRoomState(io, room);
         if (socket.id === wasDrawerId && (room.phase === 'drawing' || room.phase === 'choosing')) {
@@ -536,6 +649,10 @@ io.on('connection', (socket) => {
         // Cleanup: delete room if empty
         if (room.players.size === 0) {
           try { clearRoomTimers(room); } catch {}
+          try {
+            const roomsCol = getRoomsCol();
+            if (roomsCol) await roomsCol.updateOne({ _id: code }, { $set: { phase: 'ended', endedAt: new Date() } });
+          } catch {}
           rooms.delete(code);
         }
       }
