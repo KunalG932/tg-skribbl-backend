@@ -7,6 +7,7 @@ export function broadcastRoomState(io, room) {
     id: p.id, 
     name: p.name, 
     tgId: p.tgId || null, 
+    avatarUrl: p.avatarUrl || null,
     score: p.score, 
     guessed: p.guessed
   }));

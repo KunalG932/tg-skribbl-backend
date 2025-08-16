@@ -292,7 +292,7 @@ io.on('connection', (socket) => {
     })();
   });
 
-  socket.on('join_room', async ({ code, name, tgId, initData }) => {
+  socket.on('join_room', async ({ code, name, tgId, initData, avatarUrl }) => {
     if (!roomJoinLimiter.allow()) {
       io.to(socket.id).emit('chat', { system: true, message: 'Slow down: joining too fast.' });
       return;
@@ -351,6 +351,7 @@ io.on('connection', (socket) => {
         const p = room.players.get(socket.id);
         p.name = name?.slice(0, 24) || p.name;
         p.tgId = tgId || p.tgId;
+        if (avatarUrl) p.avatarUrl = String(avatarUrl);
         socket.join(raw);
         socket.join(socket.id);
         broadcastRoomState(io, room);
@@ -378,6 +379,7 @@ io.on('connection', (socket) => {
         id: socket.id, 
         name: name?.slice(0, 24) || 'Player', 
         tgId: tgId || null,
+        avatarUrl: avatarUrl ? String(avatarUrl) : null,
         score: 0, 
         guessed: false
       });
@@ -409,6 +411,7 @@ io.on('connection', (socket) => {
       const p = room.players.get(socket.id);
       p.name = name?.slice(0, 24) || p.name;
       p.tgId = tgId || p.tgId;
+      if (avatarUrl) p.avatarUrl = String(avatarUrl);
       socket.join(raw);
       socket.join(socket.id);
       broadcastRoomState(io, room);
@@ -436,6 +439,7 @@ io.on('connection', (socket) => {
       id: socket.id, 
       name: name?.slice(0, 24) || 'Player', 
       tgId: tgId || null,
+      avatarUrl: avatarUrl ? String(avatarUrl) : null,
       score: 0, 
       guessed: false
     });
@@ -638,7 +642,7 @@ io.on('connection', (socket) => {
       }
     }
     // Prevent name spoofing: always use server-side player.name
-    io.to(code).emit('chat', { name: player.name, message: text });
+    io.to(code).emit('chat', { name: player.name, message: text, tgId: player.tgId || null, avatarUrl: player.avatarUrl || null, ts: Date.now() });
   });
 
   socket.on('disconnecting', async () => {
