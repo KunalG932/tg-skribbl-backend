@@ -336,6 +336,16 @@ io.on('connection', (socket) => {
       if (!room) {
         room = createRoom(raw);
       }
+      // Capture or reconcile host identity
+      if (!room.hostId) room.hostId = socket.id; // should already be set by create_room
+      // Only the original host socket may stamp hostTgId
+      if (!room.hostTgId && tgId && socket.id === room.hostId) {
+        room.hostTgId = String(tgId);
+      }
+      // If the same host (by tgId) reconnects with a new socket, move hostId
+      if (room.hostTgId && tgId && String(room.hostTgId) === String(tgId)) {
+        room.hostId = socket.id;
+      }
       
       if (room.players.has(socket.id)) {
         const p = room.players.get(socket.id);
@@ -470,13 +480,12 @@ io.on('connection', (socket) => {
         io.to(socket.id).emit('app_error', { code: 'ROOM_NOT_FOUND', room: raw });
         return;
       }
-      // Only host may close the room (fallback: must be in room)
-      if (room.hostId && socket.id !== room.hostId) {
+      // Only host may close the room (allow by hostId or hostTgId match)
+      const player = room.players.get(socket.id);
+      const isHostById = room.hostId && socket.id === room.hostId;
+      const isHostByTg = room.hostTgId && player?.tgId && String(room.hostTgId) === String(player.tgId);
+      if (!(isHostById || isHostByTg)) {
         io.to(socket.id).emit('app_error', { code: 'NOT_HOST', room: raw });
-        return;
-      }
-      if (!room.players.has(socket.id)) {
-        io.to(socket.id).emit('app_error', { code: 'NOT_IN_ROOM', room: raw });
         return;
       }
       // Mark ended in memory

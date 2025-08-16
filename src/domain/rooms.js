@@ -21,6 +21,8 @@ export function broadcastRoomState(io, room) {
     hint: room.hint || null,
     phase: room.phase,
     timer: room.timer,
+    hostId: room.hostId || null,
+    hostTgId: room.hostTgId || null,
   });
 }
 
