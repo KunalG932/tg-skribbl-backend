@@ -337,13 +337,13 @@ io.on('connection', (socket) => {
         room = createRoom(raw);
       }
       // Capture or reconcile host identity
-      if (!room.hostId) room.hostId = socket.id; // should already be set by create_room
-      // Only the original host socket may stamp hostTgId
-      if (!room.hostTgId && tgId && socket.id === room.hostId) {
+      if (!room.hostId) room.hostId = socket.id; // initial creator (may be bot)
+      // If the room was created by a non-TG client (no hostTgId yet), promote first TG joiner to host
+      if (!room.hostTgId && tgId) {
         room.hostTgId = String(tgId);
-      }
-      // If the same host (by tgId) reconnects with a new socket, move hostId
-      if (room.hostTgId && tgId && String(room.hostTgId) === String(tgId)) {
+        room.hostId = socket.id;
+      } else if (room.hostTgId && tgId && String(room.hostTgId) === String(tgId)) {
+        // If the same host (by tgId) reconnects with a new socket, move hostId
         room.hostId = socket.id;
       }
       
